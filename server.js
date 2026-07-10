@@ -231,13 +231,19 @@ dbFallback.users.push({
 });
 
 // Helper to query DB or fallback
+// Guards against passing non-UUID strings into UUID columns, which would
+// crash PostgreSQL with "invalid input syntax for type uuid".
 async function executeQuery(text, params) {
   if (pool) {
     try {
       const res = await pool.query(text, params);
       return res.rows;
     } catch (e) {
-      console.warn("DB Query failed, using fallback database. Error:", e.message);
+      // Only log non-UUID type errors as warnings (UUID errors are developer noise
+      // when the app is running with the in-memory fallback user IDs like "user-123").
+      if (!e.message.includes('invalid input syntax for type uuid')) {
+        console.warn("DB Query failed, using fallback database. Error:", e.message);
+      }
     }
   }
   return null;
@@ -258,6 +264,9 @@ const authenticateToken = (req, res, next) => {
   jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ message: "Invalid or expired token" });
     req.user = user;
+    // Flag whether this user's ID is a real PostgreSQL UUID.
+    // Routes can use req.user.hasRealUUID to decide whether to bother querying the DB.
+    req.user.hasRealUUID = isValidUUID(user.id);
     next();
   });
 };
@@ -278,35 +287,57 @@ app.post('/api/auth/register', async (req, res) => {
 
   const hashedPassword = await bcrypt.hash(password, 10);
 
-  // DB logic
+  // ── Check for existing email in DB first to avoid the unique-constraint crash ──
+  if (pool) {
+    const existing = await executeQuery('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing && existing.length > 0) {
+      return res.status(400).json({ message: "Email already registered" });
+    }
+  }
+
+  // DB logic — use ON CONFLICT as a final safety net
   let dbResult = await executeQuery(
-    'INSERT INTO users (name, email, password, role) VALUES ($1, $2, $3, $4) RETURNING id, name, email, role',
+    `INSERT INTO users (name, email, password, role)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (email) DO NOTHING
+     RETURNING id, name, email, role`,
     [name, email, hashedPassword, role]
   );
 
-  if (dbResult) {
+  // ON CONFLICT DO NOTHING returns empty array if email already existed
+  if (dbResult && dbResult.length === 0) {
+    return res.status(400).json({ message: "Email already registered" });
+  }
+
+  if (dbResult && dbResult[0]) {
     const user = dbResult[0];
     if (role === 'vendor') {
-      await executeQuery('INSERT INTO vendors (user_id, store_name) VALUES ($1, $2)', [user.id, name + ' Store']);
+      await executeQuery('INSERT INTO vendors (user_id, store_name) VALUES ($1, $2) ON CONFLICT DO NOTHING', [user.id, name + ' Store']);
     }
-    // Setup NXL wallet
-    const walletRes = await executeQuery('INSERT INTO nxl_wallet (user_id, balance) VALUES ($1, 0) RETURNING id', [user.id]);
+    // Setup NXL wallet — ON CONFLICT guards against duplicate wallet
+    const walletRes = await executeQuery(
+      'INSERT INTO nxl_wallet (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING RETURNING id',
+      [user.id]
+    );
     if (walletRes && walletRes[0]) {
-      await executeQuery('INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, 50, \'ADDED\', \'Welcome bonus NXL credits\')', [walletRes[0].id]);
+      await executeQuery(
+        "INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, 50, 'ADDED', 'Welcome bonus NXL credits')",
+        [walletRes[0].id]
+      );
       await executeQuery('UPDATE nxl_wallet SET balance = 50 WHERE id = $1', [walletRes[0].id]);
     }
     const token = jwt.sign({ id: user.id, name: user.name, email: user.email, role: user.role }, JWT_SECRET);
     return res.status(201).json({ token, user });
   }
 
-  // Fallback Logic
-  const existing = dbFallback.users.find(u => u.email === email);
-  if (existing) return res.status(400).json({ message: "Email already registered" });
+  // Fallback Logic (DB unavailable)
+  const existingFallback = dbFallback.users.find(u => u.email === email);
+  if (existingFallback) return res.status(400).json({ message: "Email already registered" });
 
   const newUser = { id: `user-${Date.now()}`, name, email, password: hashedPassword, role };
   dbFallback.users.push(newUser);
   dbFallback.wallets[newUser.id] = {
-    balance: 50.0, // Welcome credits
+    balance: 50.0,
     transactions: [{
       id: `tx-${Date.now()}`,
       amount: 50.0,
@@ -331,7 +362,6 @@ app.post('/api/auth/login', async (req, res) => {
     if (!match) return res.status(400).json({ message: "Invalid email or password" });
 
     // If this is a vendor, ensure all local seed products exist in PostgreSQL
-    // under their real UUID so dashboard metrics always work correctly.
     if (user.role === 'vendor') {
       seedVendorProductsToDb(user.id).catch(e =>
         console.warn('[SeedProducts] Error during vendor product seed:', e.message)
@@ -400,18 +430,19 @@ app.post('/api/products', authenticateToken, async (req, res) => {
   if (req.user.role !== 'vendor') return res.status(403).json({ message: "Only vendors can add products" });
   const { name, description, price, stock, category, image_url } = req.body;
 
-  let dbResult = await executeQuery(
-    'INSERT INTO products (vendor_id, name, description, price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-    [req.user.id, name, description, price, stock, image_url]
-  );
-  if (dbResult) return res.status(201).json(dbResult[0]);
+  if (req.user.hasRealUUID) {
+    let dbResult = await executeQuery(
+      'INSERT INTO products (vendor_id, name, description, price, stock, image_url) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+      [req.user.id, name, description, price, stock, image_url]
+    );
+    if (dbResult) return res.status(201).json(dbResult[0]);
+  }
 
   // Fallback
   const newProduct = {
     id: `prod-${Date.now()}`,
     vendor_id: req.user.id,
-    name,
-    description,
+    name, description,
     price: parseFloat(price),
     stock: parseInt(stock),
     category,
@@ -425,19 +456,20 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'vendor') return res.status(403).json({ message: "Only vendors can modify products" });
   const { name, description, price, stock, category, image_url } = req.body;
 
-  let dbResult = await executeQuery(
-    'UPDATE products SET name=$1, description=$2, price=$3, stock=$4, image_url=$5 WHERE id=$6 AND vendor_id=$7 RETURNING *',
-    [name, description, price, stock, image_url, req.params.id, req.user.id]
-  );
-  if (dbResult) {
-    if (dbResult.length === 0) return res.status(404).json({ message: "Product not found or not owner" });
-    return res.json(dbResult[0]);
+  if (req.user.hasRealUUID && isValidUUID(req.params.id)) {
+    let dbResult = await executeQuery(
+      'UPDATE products SET name=$1, description=$2, price=$3, stock=$4, image_url=$5 WHERE id=$6 AND vendor_id=$7 RETURNING *',
+      [name, description, price, stock, image_url, req.params.id, req.user.id]
+    );
+    if (dbResult) {
+      if (dbResult.length === 0) return res.status(404).json({ message: "Product not found or not owner" });
+      return res.json(dbResult[0]);
+    }
   }
 
   // Fallback
   const index = dbFallback.products.findIndex(p => p.id === req.params.id && p.vendor_id === req.user.id);
   if (index === -1) return res.status(404).json({ message: "Product not found or not owner" });
-
   dbFallback.products[index] = {
     ...dbFallback.products[index],
     name, description,
@@ -452,28 +484,30 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
 app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   if (req.user.role !== 'vendor') return res.status(403).json({ message: "Only vendors can delete products" });
 
-  let dbResult = await executeQuery('DELETE FROM products WHERE id=$1 AND vendor_id=$2 RETURNING id', [req.params.id, req.user.id]);
-  if (dbResult) {
-    if (dbResult.length === 0) return res.status(404).json({ message: "Product not found or not owner" });
-    return res.json({ message: "Product deleted successfully" });
+  if (req.user.hasRealUUID && isValidUUID(req.params.id)) {
+    let dbResult = await executeQuery('DELETE FROM products WHERE id=$1 AND vendor_id=$2 RETURNING id', [req.params.id, req.user.id]);
+    if (dbResult) {
+      if (dbResult.length === 0) return res.status(404).json({ message: "Product not found or not owner" });
+      return res.json({ message: "Product deleted successfully" });
+    }
   }
 
   // Fallback
   const index = dbFallback.products.findIndex(p => p.id === req.params.id && p.vendor_id === req.user.id);
   if (index === -1) return res.status(404).json({ message: "Product not found or not owner" });
-
   dbFallback.products.splice(index, 1);
   res.json({ message: "Product deleted successfully" });
 });
 
 // 4. Cart Operations
 app.get('/api/cart', authenticateToken, async (req, res) => {
-  let dbResult = await executeQuery(
-    'SELECT c.id, c.quantity, p.id as product_id, p.name, p.price, p.image_url, p.description FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id = $1',
-    [req.user.id]
-  );
-  if (dbResult) return res.json(dbResult);
-
+  if (req.user.hasRealUUID) {
+    let dbResult = await executeQuery(
+      'SELECT c.id, c.quantity, p.id as product_id, p.name, p.price, p.image_url, p.description, p.stock, p.vendor_id FROM cart c JOIN products p ON c.product_id = p.id WHERE c.user_id = $1',
+      [req.user.id]
+    );
+    if (dbResult) return res.json(dbResult);
+  }
   // Fallback
   const items = dbFallback.cart[req.user.id] || [];
   const populated = items.map(item => {
@@ -484,7 +518,9 @@ app.get('/api/cart', authenticateToken, async (req, res) => {
       name: prod ? prod.name : 'Unknown Product',
       price: prod ? prod.price : 0.00,
       image_url: prod ? prod.image_url : '',
-      description: prod ? prod.description : ''
+      description: prod ? prod.description : '',
+      stock: prod ? prod.stock : 0,
+      vendor_id: prod ? prod.vendor_id : ''
     };
   });
   res.json(populated);
@@ -492,12 +528,13 @@ app.get('/api/cart', authenticateToken, async (req, res) => {
 
 app.post('/api/cart', authenticateToken, async (req, res) => {
   const { product_id, quantity } = req.body;
-  let dbResult = await executeQuery(
-    'INSERT INTO cart (user_id, product_id, quantity) VALUES ($1, $2, $3) ON CONFLICT (user_id, product_id) DO UPDATE SET quantity = cart.quantity + EXCLUDED.quantity RETURNING *',
-    [req.user.id, product_id, quantity || 1]
-  );
-  if (dbResult) return res.status(201).json(dbResult[0]);
-
+  if (req.user.hasRealUUID && isValidUUID(product_id)) {
+    let dbResult = await executeQuery(
+      'INSERT INTO cart (user_id, product_id, quantity) VALUES ($1, $2, $3) ON CONFLICT (user_id, product_id) DO UPDATE SET quantity = cart.quantity + EXCLUDED.quantity RETURNING *',
+      [req.user.id, product_id, quantity || 1]
+    );
+    if (dbResult) return res.status(201).json(dbResult[0]);
+  }
   // Fallback
   if (!dbFallback.cart[req.user.id]) dbFallback.cart[req.user.id] = [];
   const cartItems = dbFallback.cart[req.user.id];
@@ -513,12 +550,13 @@ app.post('/api/cart', authenticateToken, async (req, res) => {
 // DELETE /api/cart/:productId — remove a single item from cart (user-scoped)
 app.delete('/api/cart/:productId', authenticateToken, async (req, res) => {
   const { productId } = req.params;
-  let dbResult = await executeQuery(
-    'DELETE FROM cart WHERE user_id = $1 AND product_id = $2 RETURNING *',
-    [req.user.id, productId]
-  );
-  if (dbResult !== null) return res.json({ message: 'Removed from cart' });
-
+  if (req.user.hasRealUUID && isValidUUID(productId)) {
+    let dbResult = await executeQuery(
+      'DELETE FROM cart WHERE user_id = $1 AND product_id = $2 RETURNING *',
+      [req.user.id, productId]
+    );
+    if (dbResult !== null) return res.json({ message: 'Removed from cart' });
+  }
   // Fallback
   if (dbFallback.cart[req.user.id]) {
     dbFallback.cart[req.user.id] = dbFallback.cart[req.user.id].filter(
@@ -533,12 +571,13 @@ app.put('/api/cart/:productId', authenticateToken, async (req, res) => {
   const { productId } = req.params;
   const { quantity } = req.body;
   if (!quantity || quantity <= 0) {
-    // Treat quantity <= 0 as a remove
-    let del = await executeQuery(
-      'DELETE FROM cart WHERE user_id = $1 AND product_id = $2 RETURNING *',
-      [req.user.id, productId]
-    );
-    if (del !== null) return res.json({ message: 'Removed from cart' });
+    if (req.user.hasRealUUID && isValidUUID(productId)) {
+      let del = await executeQuery(
+        'DELETE FROM cart WHERE user_id = $1 AND product_id = $2 RETURNING *',
+        [req.user.id, productId]
+      );
+      if (del !== null) return res.json({ message: 'Removed from cart' });
+    }
     if (dbFallback.cart[req.user.id]) {
       dbFallback.cart[req.user.id] = dbFallback.cart[req.user.id].filter(
         item => item.productId !== productId
@@ -546,12 +585,13 @@ app.put('/api/cart/:productId', authenticateToken, async (req, res) => {
     }
     return res.json({ message: 'Removed from cart' });
   }
-  let dbResult = await executeQuery(
-    'UPDATE cart SET quantity = $1 WHERE user_id = $2 AND product_id = $3 RETURNING *',
-    [quantity, req.user.id, productId]
-  );
-  if (dbResult !== null) return res.json(dbResult[0] || { message: 'Updated' });
-
+  if (req.user.hasRealUUID && isValidUUID(productId)) {
+    let dbResult = await executeQuery(
+      'UPDATE cart SET quantity = $1 WHERE user_id = $2 AND product_id = $3 RETURNING *',
+      [quantity, req.user.id, productId]
+    );
+    if (dbResult !== null) return res.json(dbResult[0] || { message: 'Updated' });
+  }
   // Fallback
   if (dbFallback.cart[req.user.id]) {
     const item = dbFallback.cart[req.user.id].find(i => i.productId === productId);
@@ -561,29 +601,28 @@ app.put('/api/cart/:productId', authenticateToken, async (req, res) => {
 });
 
 // ─── WISHLIST ROUTES (user-scoped) ─────────────────────────────────────────
-// GET /api/wishlist — fetch current user's wishlist product IDs
 app.get('/api/wishlist', authenticateToken, async (req, res) => {
-  let dbResult = await executeQuery(
-    'SELECT product_id FROM wishlist WHERE user_id = $1',
-    [req.user.id]
-  );
-  if (dbResult !== null) return res.json(dbResult.map(r => r.product_id));
-
-  // Fallback
+  if (req.user.hasRealUUID) {
+    let dbResult = await executeQuery(
+      'SELECT product_id FROM wishlist WHERE user_id = $1',
+      [req.user.id]
+    );
+    if (dbResult !== null) return res.json(dbResult.map(r => r.product_id));
+  }
   res.json(dbFallback.wishlist[req.user.id] || []);
 });
 
-// POST /api/wishlist — add a product to wishlist
 app.post('/api/wishlist', authenticateToken, async (req, res) => {
   const { product_id } = req.body;
   if (!product_id) return res.status(400).json({ message: 'product_id is required' });
 
-  let dbResult = await executeQuery(
-    'INSERT INTO wishlist (user_id, product_id) VALUES ($1, $2) ON CONFLICT (user_id, product_id) DO NOTHING RETURNING *',
-    [req.user.id, product_id]
-  );
-  if (dbResult !== null) return res.status(201).json({ message: 'Added to wishlist' });
-
+  if (req.user.hasRealUUID && isValidUUID(product_id)) {
+    let dbResult = await executeQuery(
+      'INSERT INTO wishlist (user_id, product_id) VALUES ($1, $2) ON CONFLICT (user_id, product_id) DO NOTHING RETURNING *',
+      [req.user.id, product_id]
+    );
+    if (dbResult !== null) return res.status(201).json({ message: 'Added to wishlist' });
+  }
   // Fallback
   if (!dbFallback.wishlist[req.user.id]) dbFallback.wishlist[req.user.id] = [];
   if (!dbFallback.wishlist[req.user.id].includes(product_id)) {
@@ -592,15 +631,15 @@ app.post('/api/wishlist', authenticateToken, async (req, res) => {
   res.status(201).json({ message: 'Added to wishlist' });
 });
 
-// DELETE /api/wishlist/:productId — remove a product from wishlist
 app.delete('/api/wishlist/:productId', authenticateToken, async (req, res) => {
   const { productId } = req.params;
-  let dbResult = await executeQuery(
-    'DELETE FROM wishlist WHERE user_id = $1 AND product_id = $2 RETURNING *',
-    [req.user.id, productId]
-  );
-  if (dbResult !== null) return res.json({ message: 'Removed from wishlist' });
-
+  if (req.user.hasRealUUID && isValidUUID(productId)) {
+    let dbResult = await executeQuery(
+      'DELETE FROM wishlist WHERE user_id = $1 AND product_id = $2 RETURNING *',
+      [req.user.id, productId]
+    );
+    if (dbResult !== null) return res.json({ message: 'Removed from wishlist' });
+  }
   // Fallback
   if (dbFallback.wishlist[req.user.id]) {
     dbFallback.wishlist[req.user.id] = dbFallback.wishlist[req.user.id].filter(
@@ -665,19 +704,19 @@ app.post('/api/coupons/validate', authenticateToken, async (req, res) => {
 
 // 5. Wallet
 app.get('/api/wallet', authenticateToken, async (req, res) => {
-  let wallet = await executeQuery('SELECT balance FROM nxl_wallet WHERE user_id = $1', [req.user.id]);
-  let transactions = await executeQuery(
-    'SELECT t.* FROM nxl_transactions t JOIN nxl_wallet w ON t.wallet_id = w.id WHERE w.user_id = $1 ORDER BY t.created_at DESC',
-    [req.user.id]
-  );
-
-  if (wallet) {
-    return res.json({
-      balance: parseFloat(wallet[0]?.balance || 0),
-      transactions: transactions || []
-    });
+  if (req.user.hasRealUUID) {
+    let wallet = await executeQuery('SELECT balance FROM nxl_wallet WHERE user_id = $1', [req.user.id]);
+    let transactions = await executeQuery(
+      'SELECT t.* FROM nxl_transactions t JOIN nxl_wallet w ON t.wallet_id = w.id WHERE w.user_id = $1 ORDER BY t.created_at DESC',
+      [req.user.id]
+    );
+    if (wallet) {
+      return res.json({
+        balance: parseFloat(wallet[0]?.balance || 0),
+        transactions: transactions || []
+      });
+    }
   }
-
   // Fallback
   if (!dbFallback.wallets[req.user.id]) {
     dbFallback.wallets[req.user.id] = { balance: 0.00, transactions: [] };
@@ -689,12 +728,16 @@ app.post('/api/wallet/add', authenticateToken, async (req, res) => {
   const { amount } = req.body;
   if (!amount || amount <= 0) return res.status(400).json({ message: "Invalid amount" });
 
-  let walletRes = await executeQuery('UPDATE nxl_wallet SET balance = balance + $1 WHERE user_id = $2 RETURNING *', [amount, req.user.id]);
-  if (walletRes && walletRes[0]) {
-    await executeQuery('INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, \'ADDED\', \'Loaded money to wallet\')', [walletRes[0].id, amount]);
-    return res.json({ balance: walletRes[0].balance });
+  if (req.user.hasRealUUID) {
+    let walletRes = await executeQuery('UPDATE nxl_wallet SET balance = balance + $1 WHERE user_id = $2 RETURNING *', [amount, req.user.id]);
+    if (walletRes && walletRes[0]) {
+      await executeQuery(
+        "INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'ADDED', 'Loaded money to wallet')",
+        [walletRes[0].id, amount]
+      );
+      return res.json({ balance: walletRes[0].balance });
+    }
   }
-
   // Fallback
   if (!dbFallback.wallets[req.user.id]) {
     dbFallback.wallets[req.user.id] = { balance: 0.00, transactions: [] };
@@ -712,60 +755,55 @@ app.post('/api/wallet/add', authenticateToken, async (req, res) => {
 
 // 6. Orders
 app.get('/api/orders', authenticateToken, async (req, res) => {
-  let dbResult;
-  if (req.user.role === 'admin') {
-    // Admin sees all orders
-    dbResult = await executeQuery(
-      'SELECT o.id, o.total_amount, o.discount_amount, o.net_amount, o.status, o.shipping_address, o.created_at, u.name as customer_name FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC'
-    );
-  } else if (req.user.role === 'vendor') {
-    // Vendor sees only orders that contain at least one of their products
-    dbResult = await executeQuery(
-      `SELECT DISTINCT o.id, o.total_amount, o.discount_amount, o.net_amount, o.status, o.shipping_address, o.created_at, u.name as customer_name
-       FROM orders o
-       JOIN users u ON o.user_id = u.id
-       JOIN order_items oi ON oi.order_id = o.id
-       JOIN products p ON p.id = oi.product_id
-       WHERE p.vendor_id = $1
-       ORDER BY o.created_at DESC`,
-      [req.user.id]
-    );
-  } else {
-    // Customer sees only their own orders
-    dbResult = await executeQuery(
-      'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
-      [req.user.id]
-    );
-  }
-
-  if (dbResult) {
-    // Single bulk query — fetch all items for all orders at once (no N+1 queries).
-    // Priority: snapshot (product_name col saved at purchase time) → live products JOIN.
-    // This guarantees names are always resolved even after product edits/deletes.
-    const orderIds = dbResult.map(o => o.id);
-    const allItems = orderIds.length > 0
-      ? await executeQuery(
-          `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price,
-                  COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS name,
-                  COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS product_name,
-                  COALESCE(NULLIF(oi.image_url, ''),    p.image_url, '') AS image_url
-           FROM order_items oi
-           LEFT JOIN products p ON oi.product_id = p.id
-           WHERE oi.order_id = ANY($1::uuid[])`,
-          [orderIds]
-        )
-      : [];
-    // Group items by order_id
-    const itemsByOrder = {};
-    for (const item of (allItems || [])) {
-      if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
-      itemsByOrder[item.order_id].push(item);
+  if (req.user.hasRealUUID) {
+    let dbResult;
+    if (req.user.role === 'admin') {
+      dbResult = await executeQuery(
+        'SELECT o.id, o.total_amount, o.discount_amount, o.net_amount, o.status, o.shipping_address, o.created_at, u.name as customer_name FROM orders o JOIN users u ON o.user_id = u.id ORDER BY o.created_at DESC'
+      );
+    } else if (req.user.role === 'vendor') {
+      dbResult = await executeQuery(
+        `SELECT DISTINCT o.id, o.total_amount, o.discount_amount, o.net_amount, o.status, o.shipping_address, o.created_at, u.name as customer_name
+         FROM orders o
+         JOIN users u ON o.user_id = u.id
+         JOIN order_items oi ON oi.order_id = o.id
+         JOIN products p ON p.id = oi.product_id
+         WHERE p.vendor_id = $1
+         ORDER BY o.created_at DESC`,
+        [req.user.id]
+      );
+    } else {
+      dbResult = await executeQuery(
+        'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
+        [req.user.id]
+      );
     }
-    const enriched = dbResult.map(order => ({
-      ...order,
-      items: itemsByOrder[order.id] || [],
-    }));
-    return res.json(enriched);
+
+    if (dbResult) {
+      const orderIds = dbResult.map(o => o.id).filter(id => isValidUUID(id));
+      const allItems = orderIds.length > 0
+        ? await executeQuery(
+            `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price,
+                    COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS name,
+                    COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS product_name,
+                    COALESCE(NULLIF(oi.image_url, ''),    p.image_url, '') AS image_url
+             FROM order_items oi
+             LEFT JOIN products p ON oi.product_id = p.id
+             WHERE oi.order_id = ANY($1::uuid[])`,
+            [orderIds]
+          )
+        : [];
+      const itemsByOrder = {};
+      for (const item of (allItems || [])) {
+        if (!itemsByOrder[item.order_id]) itemsByOrder[item.order_id] = [];
+        itemsByOrder[item.order_id].push(item);
+      }
+      const enriched = dbResult.map(order => ({
+        ...order,
+        items: itemsByOrder[order.id] || [],
+      }));
+      return res.json(enriched);
+    }
   }
 
   // Fallback
@@ -773,7 +811,6 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
     return res.json(dbFallback.orders);
   }
   if (req.user.role === 'vendor') {
-    // Filter to orders containing this vendor's products
     const vendorProductIds = new Set(
       dbFallback.products.filter(p => p.vendor_id === req.user.id).map(p => p.id)
     );
@@ -787,90 +824,85 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
 app.post('/api/orders', authenticateToken, async (req, res) => {
   const { items, total_amount, discount_amount, net_amount, shipping_address, payment_method, redeem_credits } = req.body;
 
-  // DB logic
-  let dbOrder = await executeQuery(
-    'INSERT INTO orders (user_id, total_amount, discount_amount, net_amount, status, shipping_address) VALUES ($1, $2, $3, $4, \'Pending\', $5) RETURNING *',
-    [req.user.id, total_amount, discount_amount, net_amount, shipping_address]
-  );
-
-  if (dbOrder && dbOrder[0]) {
-    const order = dbOrder[0];
-    // Add items — save product_name and image_url snapshot at purchase time
-    for (const item of items) {
-      // item payload from Flutter: { product_id, name, quantity, price, image_url }
-      const snapshotName  = (item.name || item.product_name || '').toString().trim();
-      const snapshotImage = (item.image_url || '').toString().trim();
-
-      // Only insert into DB if product_id is a valid UUID (not a fallback id like "prod-3")
-      if (isValidUUID(item.product_id)) {
-        await executeQuery(
-          'INSERT INTO order_items (order_id, product_id, quantity, price, product_name, image_url) VALUES ($1, $2, $3, $4, $5, $6)',
-          [order.id, item.product_id, item.quantity, item.price, snapshotName, snapshotImage]
-        );
-        // Reduce stock
-        await executeQuery('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.product_id]);
-      } else {
-        // Fallback product — insert without product_id foreign key reference
-        await executeQuery(
-          'INSERT INTO order_items (order_id, product_id, quantity, price, product_name, image_url) VALUES ($1, NULL, $2, $3, $4, $5)',
-          [order.id, item.quantity, item.price, snapshotName, snapshotImage]
-        );
-        // Reduce stock in in-memory fallback
-        const fbProd = dbFallback.products.find(p => p.id === item.product_id);
-        if (fbProd) fbProd.stock = Math.max(0, fbProd.stock - item.quantity);
-      }
-    }
-    // Deduct credits if used
-    if (redeem_credits && redeem_credits > 0) {
-      let wallet = await executeQuery('UPDATE nxl_wallet SET balance = balance - $1 WHERE user_id = $2 RETURNING id', [redeem_credits, req.user.id]);
-      if (wallet && wallet[0]) {
-        await executeQuery('INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, \'REDEEMED\', $3)', [wallet[0].id, redeem_credits, `Discount on Order #${order.id.substring(0,8)}`]);
-      }
-    }
-    // Earn NXL credits: ₹100 spent = 5 credits
-    const earnedCredits = Math.floor(net_amount / 100) * 5;
-    if (earnedCredits > 0) {
-      let wallet = await executeQuery('UPDATE nxl_wallet SET balance = balance + $1 WHERE user_id = $2 RETURNING id', [earnedCredits, req.user.id]);
-      if (wallet && wallet[0]) {
-        await executeQuery('INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, \'EARNED\', $3)', [wallet[0].id, earnedCredits, `Earned from Order #${order.id.substring(0,8)}`]);
-      }
-    }
-    // Create mock payment entry
-    await executeQuery(
-      'INSERT INTO payments (order_id, payment_method, payment_status, amount_paid) VALUES ($1, $2, \'Success\', $3)',
-      [order.id, payment_method, net_amount]
+  // Only attempt DB insert when the user has a real UUID
+  if (req.user.hasRealUUID) {
+    let dbOrder = await executeQuery(
+      "INSERT INTO orders (user_id, total_amount, discount_amount, net_amount, status, shipping_address) VALUES ($1, $2, $3, $4, 'Pending', $5) RETURNING *",
+      [req.user.id, total_amount, discount_amount, net_amount, shipping_address]
     );
 
-    // Clear cart
-    await executeQuery('DELETE FROM cart WHERE user_id = $1', [req.user.id]);
+    if (dbOrder && dbOrder[0]) {
+      const order = dbOrder[0];
+      for (const item of items) {
+        const snapshotName  = (item.name || item.product_name || '').toString().trim();
+        const snapshotImage = (item.image_url || '').toString().trim();
 
-    // Re-fetch items with real product names from DB
-    const savedItems = await executeQuery(
-      `SELECT oi.product_id, oi.quantity, oi.price,
-              COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS name,
-              COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS product_name,
-              COALESCE(NULLIF(oi.image_url, ''),    p.image_url, '') AS image_url
-       FROM order_items oi
-       LEFT JOIN products p ON oi.product_id = p.id
-       WHERE oi.order_id = $1`,
-      [order.id]
-    );
+        if (isValidUUID(item.product_id)) {
+          await executeQuery(
+            'INSERT INTO order_items (order_id, product_id, quantity, price, product_name, image_url) VALUES ($1, $2, $3, $4, $5, $6)',
+            [order.id, item.product_id, item.quantity, item.price, snapshotName, snapshotImage]
+          );
+          await executeQuery('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.product_id]);
+        } else {
+          await executeQuery(
+            'INSERT INTO order_items (order_id, product_id, quantity, price, product_name, image_url) VALUES ($1, NULL, $2, $3, $4, $5)',
+            [order.id, item.quantity, item.price, snapshotName, snapshotImage]
+          );
+          const fbProd = dbFallback.products.find(p => p.id === item.product_id);
+          if (fbProd) fbProd.stock = Math.max(0, fbProd.stock - item.quantity);
+        }
+      }
+      if (redeem_credits && redeem_credits > 0) {
+        let wallet = await executeQuery('UPDATE nxl_wallet SET balance = balance - $1 WHERE user_id = $2 RETURNING id', [redeem_credits, req.user.id]);
+        if (wallet && wallet[0]) {
+          await executeQuery(
+            "INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'REDEEMED', $3)",
+            [wallet[0].id, redeem_credits, `Discount on Order #${order.id.substring(0,8)}`]
+          );
+        }
+      }
+      const earnedCredits = Math.floor(net_amount / 100) * 5;
+      if (earnedCredits > 0) {
+        let wallet = await executeQuery('UPDATE nxl_wallet SET balance = balance + $1 WHERE user_id = $2 RETURNING id', [earnedCredits, req.user.id]);
+        if (wallet && wallet[0]) {
+          await executeQuery(
+            "INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'EARNED', $3)",
+            [wallet[0].id, earnedCredits, `Earned from Order #${order.id.substring(0,8)}`]
+          );
+        }
+      }
+      await executeQuery(
+        "INSERT INTO payments (order_id, payment_method, payment_status, amount_paid) VALUES ($1, $2, 'Success', $3)",
+        [order.id, payment_method, net_amount]
+      );
+      await executeQuery('DELETE FROM cart WHERE user_id = $1', [req.user.id]);
 
-    const orderWithItems = {
-      ...order,
-      items: savedItems || items.map(item => ({
-        product_id:   item.product_id,
-        name:         item.name || item.product_name || '',
-        product_name: item.name || item.product_name || '',
-        quantity:     item.quantity,
-        price:        item.price,
-        image_url:    item.image_url || '',
-      }))
-    };
-    return res.status(201).json(orderWithItems);
+      const savedItems = await executeQuery(
+        `SELECT oi.product_id, oi.quantity, oi.price,
+                COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS name,
+                COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS product_name,
+                COALESCE(NULLIF(oi.image_url, ''),    p.image_url, '') AS image_url
+         FROM order_items oi
+         LEFT JOIN products p ON oi.product_id = p.id
+         WHERE oi.order_id = $1`,
+        [order.id]
+      );
+
+      return res.status(201).json({
+        ...order,
+        items: savedItems || items.map(item => ({
+          product_id:   item.product_id,
+          name:         item.name || item.product_name || '',
+          product_name: item.name || item.product_name || '',
+          quantity:     item.quantity,
+          price:        item.price,
+          image_url:    item.image_url || '',
+        }))
+      });
+    }
   }
 
-  // Fallback
+  // Fallback (DB unavailable or non-UUID user)
   const newOrder = {
     id: `ord-${Date.now()}`,
     user_id: req.user.id,
@@ -883,7 +915,6 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     items
   };
 
-  // Deduct NXL credits if used
   if (redeem_credits && redeem_credits > 0) {
     if (dbFallback.wallets[req.user.id]) {
       dbFallback.wallets[req.user.id].balance -= parseFloat(redeem_credits);
@@ -897,7 +928,6 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     }
   }
 
-  // Earn NXL credits: ₹100 spent = 5 credits
   const earnedCredits = Math.floor(net_amount / 100) * 5;
   if (earnedCredits > 0) {
     if (!dbFallback.wallets[req.user.id]) {
@@ -913,63 +943,63 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     });
   }
 
-  // Reduce product stocks in fallback db
   for (const item of items) {
     const prod = dbFallback.products.find(p => p.id === item.product_id);
-    if (prod) {
-      prod.stock = Math.max(0, prod.stock - item.quantity);
-    }
+    if (prod) prod.stock = Math.max(0, prod.stock - item.quantity);
   }
 
   dbFallback.orders.unshift(newOrder);
-  dbFallback.cart[req.user.id] = []; // clear cart
+  dbFallback.cart[req.user.id] = [];
   res.status(201).json(newOrder);
 });
 
 // ─── USER PROFILE & SETTINGS ─────────────────────────────────────────────────
 
-// Update profile (name)
 app.put('/api/auth/profile', authenticateToken, async (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ message: 'Name is required' });
 
-  let dbResult = await executeQuery(
-    'UPDATE users SET name=$1 WHERE id=$2 RETURNING id, name, email, role',
-    [name.trim(), req.user.id]
-  );
-  if (dbResult && dbResult[0]) return res.json(dbResult[0]);
-
+  if (req.user.hasRealUUID) {
+    let dbResult = await executeQuery(
+      'UPDATE users SET name=$1 WHERE id=$2 RETURNING id, name, email, role',
+      [name.trim(), req.user.id]
+    );
+    if (dbResult && dbResult[0]) return res.json(dbResult[0]);
+  }
   // Fallback
   const u = dbFallback.users.find(u => u.id === req.user.id);
   if (u) u.name = name.trim();
   res.json({ id: req.user.id, name: name.trim(), email: req.user.email, role: req.user.role });
 });
 
-// Change password
 app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   if (!currentPassword || !newPassword) return res.status(400).json({ message: 'Both passwords required' });
   if (newPassword.length < 6) return res.status(400).json({ message: 'New password must be at least 6 characters' });
 
-  let dbResult = await executeQuery('SELECT password FROM users WHERE id=$1', [req.user.id]);
-  if (dbResult && dbResult[0]) {
-    const match = await bcrypt.compare(currentPassword, dbResult[0].password);
-    if (!match) return res.status(400).json({ message: 'Current password is incorrect' });
-    const hashed = await bcrypt.hash(newPassword, 10);
-    await executeQuery('UPDATE users SET password=$1 WHERE id=$2', [hashed, req.user.id]);
-    return res.json({ message: 'Password changed successfully' });
+  if (req.user.hasRealUUID) {
+    let dbResult = await executeQuery('SELECT password FROM users WHERE id=$1', [req.user.id]);
+    if (dbResult && dbResult[0]) {
+      const match = await bcrypt.compare(currentPassword, dbResult[0].password);
+      if (!match) return res.status(400).json({ message: 'Current password is incorrect' });
+      const hashed = await bcrypt.hash(newPassword, 10);
+      await executeQuery('UPDATE users SET password=$1 WHERE id=$2', [hashed, req.user.id]);
+      return res.json({ message: 'Password changed successfully' });
+    }
   }
-
   // Fallback
   const u = dbFallback.users.find(u => u.id === req.user.id);
-  if (!u || u.password !== currentPassword) return res.status(400).json({ message: 'Current password is incorrect' });
-  u.password = newPassword;
+  if (!u) return res.status(404).json({ message: 'User not found' });
+  const match = await bcrypt.compare(currentPassword, u.password);
+  if (!match) return res.status(400).json({ message: 'Current password is incorrect' });
+  u.password = await bcrypt.hash(newPassword, 10);
   res.json({ message: 'Password changed successfully' });
 });
 
-// Delete account
 app.delete('/api/auth/account', authenticateToken, async (req, res) => {
-  await executeQuery('DELETE FROM users WHERE id=$1', [req.user.id]);
+  if (req.user.hasRealUUID) {
+    await executeQuery('DELETE FROM users WHERE id=$1', [req.user.id]);
+  }
   const idx = dbFallback.users.findIndex(u => u.id === req.user.id);
   if (idx !== -1) dbFallback.users.splice(idx, 1);
   res.json({ message: 'Account deleted successfully' });
@@ -979,11 +1009,13 @@ app.delete('/api/auth/account', authenticateToken, async (req, res) => {
 if (!dbFallback.addresses) dbFallback.addresses = {};
 
 app.get('/api/addresses', authenticateToken, async (req, res) => {
-  let dbResult = await executeQuery(
-    'SELECT * FROM user_addresses WHERE user_id=$1 ORDER BY is_default DESC, created_at DESC',
-    [req.user.id]
-  );
-  if (dbResult) return res.json(dbResult);
+  if (req.user.hasRealUUID) {
+    let dbResult = await executeQuery(
+      'SELECT * FROM user_addresses WHERE user_id=$1 ORDER BY is_default DESC, created_at DESC',
+      [req.user.id]
+    );
+    if (dbResult) return res.json(dbResult);
+  }
   res.json(dbFallback.addresses[req.user.id] || []);
 });
 
@@ -992,18 +1024,21 @@ app.post('/api/addresses', authenticateToken, async (req, res) => {
   if (!full_name || !address_line1 || !city || !state || !pincode) {
     return res.status(400).json({ message: 'Required fields missing' });
   }
-  if (is_default) {
-    await executeQuery('UPDATE user_addresses SET is_default=false WHERE user_id=$1', [req.user.id]);
-    if (dbFallback.addresses[req.user.id]) {
-      dbFallback.addresses[req.user.id].forEach(a => a.is_default = false);
+  if (req.user.hasRealUUID) {
+    if (is_default) {
+      await executeQuery('UPDATE user_addresses SET is_default=false WHERE user_id=$1', [req.user.id]);
     }
+    let dbResult = await executeQuery(
+      `INSERT INTO user_addresses (user_id, label, full_name, phone, address_line1, address_line2, city, state, pincode, is_default)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [req.user.id, label||'Home', full_name, phone||'', address_line1, address_line2||'', city, state, pincode, is_default||false]
+    );
+    if (dbResult) return res.status(201).json(dbResult[0]);
   }
-  let dbResult = await executeQuery(
-    `INSERT INTO user_addresses (user_id, label, full_name, phone, address_line1, address_line2, city, state, pincode, is_default)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-    [req.user.id, label||'Home', full_name, phone||'', address_line1, address_line2||'', city, state, pincode, is_default||false]
-  );
-  if (dbResult) return res.status(201).json(dbResult[0]);
+  // Fallback
+  if (is_default && dbFallback.addresses[req.user.id]) {
+    dbFallback.addresses[req.user.id].forEach(a => a.is_default = false);
+  }
   const newAddr = { id: `addr-${Date.now()}`, user_id: req.user.id, label: label||'Home', full_name, phone: phone||'', address_line1, address_line2: address_line2||'', city, state, pincode, is_default: is_default||false, created_at: new Date() };
   if (!dbFallback.addresses[req.user.id]) dbFallback.addresses[req.user.id] = [];
   dbFallback.addresses[req.user.id].push(newAddr);
@@ -1012,16 +1047,21 @@ app.post('/api/addresses', authenticateToken, async (req, res) => {
 
 app.put('/api/addresses/:id', authenticateToken, async (req, res) => {
   const { label, full_name, phone, address_line1, address_line2, city, state, pincode, is_default } = req.body;
-  if (is_default) {
-    await executeQuery('UPDATE user_addresses SET is_default=false WHERE user_id=$1', [req.user.id]);
-    if (dbFallback.addresses[req.user.id]) dbFallback.addresses[req.user.id].forEach(a => a.is_default = false);
+  if (req.user.hasRealUUID && isValidUUID(req.params.id)) {
+    if (is_default) {
+      await executeQuery('UPDATE user_addresses SET is_default=false WHERE user_id=$1', [req.user.id]);
+    }
+    let dbResult = await executeQuery(
+      `UPDATE user_addresses SET label=$1,full_name=$2,phone=$3,address_line1=$4,address_line2=$5,city=$6,state=$7,pincode=$8,is_default=$9
+       WHERE id=$10 AND user_id=$11 RETURNING *`,
+      [label, full_name, phone, address_line1, address_line2, city, state, pincode, is_default, req.params.id, req.user.id]
+    );
+    if (dbResult && dbResult[0]) return res.json(dbResult[0]);
   }
-  let dbResult = await executeQuery(
-    `UPDATE user_addresses SET label=$1,full_name=$2,phone=$3,address_line1=$4,address_line2=$5,city=$6,state=$7,pincode=$8,is_default=$9
-     WHERE id=$10 AND user_id=$11 RETURNING *`,
-    [label, full_name, phone, address_line1, address_line2, city, state, pincode, is_default, req.params.id, req.user.id]
-  );
-  if (dbResult && dbResult[0]) return res.json(dbResult[0]);
+  // Fallback
+  if (is_default && dbFallback.addresses[req.user.id]) {
+    dbFallback.addresses[req.user.id].forEach(a => a.is_default = false);
+  }
   const addrs = dbFallback.addresses[req.user.id] || [];
   const idx = addrs.findIndex(a => a.id === req.params.id);
   if (idx === -1) return res.status(404).json({ message: 'Address not found' });
@@ -1030,7 +1070,9 @@ app.put('/api/addresses/:id', authenticateToken, async (req, res) => {
 });
 
 app.delete('/api/addresses/:id', authenticateToken, async (req, res) => {
-  await executeQuery('DELETE FROM user_addresses WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+  if (req.user.hasRealUUID && isValidUUID(req.params.id)) {
+    await executeQuery('DELETE FROM user_addresses WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+  }
   if (dbFallback.addresses[req.user.id]) {
     dbFallback.addresses[req.user.id] = dbFallback.addresses[req.user.id].filter(a => a.id !== req.params.id);
   }
@@ -1068,11 +1110,13 @@ app.post('/api/wallet/buy-tokens/verify', authenticateToken, async (req, res) =>
   if (expectedSignature !== razorpay_signature) return res.status(400).json({ message: 'Payment verification failed' });
 
   // Credit NXL tokens to wallet
-  let walletRes = await executeQuery('UPDATE nxl_wallet SET balance = balance + $1 WHERE user_id = $2 RETURNING *', [nxl_tokens, req.user.id]);
-  if (walletRes && walletRes[0]) {
-    await executeQuery(`INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'ADDED', $3)`,
-      [walletRes[0].id, nxl_tokens, `Purchased ${nxl_tokens} NXL tokens for ₹${amount_inr}`]);
-    return res.json({ success: true, balance: walletRes[0].balance, tokens_added: nxl_tokens });
+  if (req.user.hasRealUUID) {
+    let walletRes = await executeQuery('UPDATE nxl_wallet SET balance = balance + $1 WHERE user_id = $2 RETURNING *', [nxl_tokens, req.user.id]);
+    if (walletRes && walletRes[0]) {
+      await executeQuery(`INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'ADDED', $3)`,
+        [walletRes[0].id, nxl_tokens, `Purchased ${nxl_tokens} NXL tokens for ₹${amount_inr}`]);
+      return res.json({ success: true, balance: walletRes[0].balance, tokens_added: nxl_tokens });
+    }
   }
   // Fallback
   if (!dbFallback.wallets[req.user.id]) dbFallback.wallets[req.user.id] = { balance: 0, transactions: [] };
@@ -1177,91 +1221,69 @@ app.post('/api/payment/verify', authenticateToken, async (req, res) => {
 
 // ─── VENDOR PROFILE ──────────────────────────────────────────────────────────
 
-// GET /api/vendor/profile — returns user + vendor store row merged
 app.get('/api/vendor/profile', authenticateToken, async (req, res) => {
   if (req.user.role !== 'vendor') return res.status(403).json({ message: 'Vendor access required' });
 
-  const userRow = await executeQuery(
-    'SELECT id, name, email, phone FROM users WHERE id = $1',
-    [req.user.id]
-  );
-  const vendorRow = await executeQuery(
-    'SELECT store_name, description, address, phone as store_phone FROM vendors WHERE user_id = $1',
-    [req.user.id]
-  );
-
-  if (userRow) {
-    const u = userRow[0] || {};
-    const v = (vendorRow && vendorRow[0]) || {};
-    return res.json({
-      id:           u.id,
-      name:         u.name || '',
-      email:        u.email || '',
-      phone:        u.phone || v.store_phone || '',
-      store_name:   v.store_name || u.name || '',
-      description:  v.description || '',
-      address:      v.address || '',
-      photo_url:    u.photo_url || '',
-    });
+  if (req.user.hasRealUUID) {
+    const userRow = await executeQuery(
+      'SELECT id, name, email, phone FROM users WHERE id = $1', [req.user.id]
+    );
+    const vendorRow = await executeQuery(
+      'SELECT store_name, description, address, phone as store_phone FROM vendors WHERE user_id = $1', [req.user.id]
+    );
+    if (userRow) {
+      const u = userRow[0] || {};
+      const v = (vendorRow && vendorRow[0]) || {};
+      return res.json({
+        id: u.id, name: u.name || '', email: u.email || '',
+        phone: u.phone || v.store_phone || '',
+        store_name: v.store_name || u.name || '',
+        description: v.description || '', address: v.address || '', photo_url: u.photo_url || '',
+      });
+    }
   }
-
   // Fallback
   const u = dbFallback.users.find(u => u.id === req.user.id) || {};
   res.json({
-    id:          u.id || req.user.id,
-    name:        u.name || '',
-    email:       u.email || '',
-    phone:       u.phone || '',
-    store_name:  u.store_name || u.name || '',
-    description: u.description || '',
-    address:     u.address || '',
-    photo_url:   u.photo_url || '',
+    id: u.id || req.user.id, name: u.name || '', email: u.email || '',
+    phone: u.phone || '', store_name: u.store_name || u.name || '',
+    description: u.description || '', address: u.address || '', photo_url: u.photo_url || '',
   });
 });
 
-// PUT /api/vendor/profile — update store_name, phone, address, photo_url
 app.put('/api/vendor/profile', authenticateToken, async (req, res) => {
   if (req.user.role !== 'vendor') return res.status(403).json({ message: 'Vendor access required' });
 
   const { store_name, phone, address, photo_url } = req.body;
 
-  // Update users table (phone, photo_url)
-  await executeQuery(
-    'UPDATE users SET phone = COALESCE($1, phone), photo_url = COALESCE($2, photo_url) WHERE id = $3',
-    [phone || null, photo_url || null, req.user.id]
-  );
-
-  // Upsert vendors row
-  const vendorExists = await executeQuery('SELECT id FROM vendors WHERE user_id = $1', [req.user.id]);
-  if (vendorExists && vendorExists.length > 0) {
+  if (req.user.hasRealUUID) {
     await executeQuery(
-      'UPDATE vendors SET store_name = COALESCE($1, store_name), address = COALESCE($2, address) WHERE user_id = $3',
-      [store_name || null, address || null, req.user.id]
+      'UPDATE users SET phone = COALESCE($1, phone), photo_url = COALESCE($2, photo_url) WHERE id = $3',
+      [phone || null, photo_url || null, req.user.id]
     );
-  } else if (vendorExists) {
-    await executeQuery(
-      'INSERT INTO vendors (user_id, store_name, address) VALUES ($1, $2, $3)',
-      [req.user.id, store_name || '', address || '']
-    );
+    const vendorExists = await executeQuery('SELECT id FROM vendors WHERE user_id = $1', [req.user.id]);
+    if (vendorExists && vendorExists.length > 0) {
+      await executeQuery(
+        'UPDATE vendors SET store_name = COALESCE($1, store_name), address = COALESCE($2, address) WHERE user_id = $3',
+        [store_name || null, address || null, req.user.id]
+      );
+    } else if (vendorExists) {
+      await executeQuery(
+        'INSERT INTO vendors (user_id, store_name, address) VALUES ($1, $2, $3)',
+        [req.user.id, store_name || '', address || '']
+      );
+    }
+    const userRow   = await executeQuery('SELECT id, name, email, phone FROM users WHERE id = $1', [req.user.id]);
+    const vendorRow = await executeQuery('SELECT store_name, address FROM vendors WHERE user_id = $1', [req.user.id]);
+    if (userRow) {
+      const u = userRow[0] || {};
+      const v = (vendorRow && vendorRow[0]) || {};
+      return res.json({
+        id: u.id, name: u.name || '', email: u.email || '', phone: u.phone || '',
+        store_name: v.store_name || '', address: v.address || '', photo_url: photo_url || '',
+      });
+    }
   }
-
-  // Re-fetch and return
-  const userRow = await executeQuery('SELECT id, name, email, phone FROM users WHERE id = $1', [req.user.id]);
-  const vendorRow = await executeQuery('SELECT store_name, address FROM vendors WHERE user_id = $1', [req.user.id]);
-  if (userRow) {
-    const u = userRow[0] || {};
-    const v = (vendorRow && vendorRow[0]) || {};
-    return res.json({
-      id:         u.id,
-      name:       u.name || '',
-      email:      u.email || '',
-      phone:      u.phone || '',
-      store_name: v.store_name || '',
-      address:    v.address || '',
-      photo_url:  photo_url || '',
-    });
-  }
-
   // Fallback
   const u = dbFallback.users.find(u => u.id === req.user.id);
   if (u) {
@@ -1271,13 +1293,9 @@ app.put('/api/vendor/profile', authenticateToken, async (req, res) => {
     if (photo_url)  u.photo_url  = photo_url;
   }
   res.json({
-    id:         req.user.id,
-    name:       u?.name || '',
-    email:      u?.email || '',
-    phone:      u?.phone || '',
-    store_name: u?.store_name || '',
-    address:    u?.address || '',
-    photo_url:  u?.photo_url || '',
+    id: req.user.id, name: u?.name || '', email: u?.email || '',
+    phone: u?.phone || '', store_name: u?.store_name || '',
+    address: u?.address || '', photo_url: u?.photo_url || '',
   });
 });
 
@@ -1312,7 +1330,7 @@ app.get('/api/vendor/stats', authenticateToken, async (req, res) => {
 
   if (orderRows !== null) {
     // Step 2: Fetch only this vendor's items for those orders
-    const orderIds = orderRows.map(o => o.id);
+    const orderIds = orderRows.map(o => o.id).filter(id => isValidUUID(id));
     const itemRows = orderIds.length > 0
       ? await executeQuery(
           `SELECT
@@ -1456,7 +1474,7 @@ app.get('/api/vendor/earnings', authenticateToken, async (req, res) => {
   );
 
   if (orderRows !== null) {
-    const orderIds = orderRows.map(o => o.id);
+    const orderIds = orderRows.map(o => o.id).filter(id => isValidUUID(id));
     const itemRows = orderIds.length > 0
       ? await executeQuery(
           `SELECT
@@ -1911,8 +1929,10 @@ app.get('/api/coupons', authenticateToken, async (req, res) => {
 
 // Customer: Get coupon history (coupons used by current customer)
 app.get('/api/coupons/history', authenticateToken, async (req, res) => {
-  const dbResult = await executeQuery('SELECT * FROM coupon_usage WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
-  if (dbResult) return res.json(dbResult);
+  if (req.user.hasRealUUID) {
+    const dbResult = await executeQuery('SELECT * FROM coupon_usage WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+    if (dbResult) return res.json(dbResult);
+  }
   res.json(dbFallback.coupon_usage.filter(cu => cu.user_id === req.user.id));
 });
 
@@ -1945,7 +1965,7 @@ app.post('/api/coupons/validate', authenticateToken, async (req, res) => {
   // Min order amount check
   const minOrder = parseFloat(coupon.min_order_amount || 0);
   if (subtotal < minOrder) {
-    return res.json({ success: false, message: `Minimum order amount to apply this coupon is ₹${minOrder.toStringAsFixed(0)}` });
+    return res.json({ success: false, message: `Minimum order amount to apply this coupon is ₹${minOrder.toFixed(0)}` });
   }
 
   // Usage Limit Check
@@ -1965,7 +1985,7 @@ app.post('/api/coupons/validate', authenticateToken, async (req, res) => {
 
   // Per User Limit Check
   const perUserLimit = parseInt(coupon.per_user_limit || 1);
-  if (perUserLimit > 0) {
+  if (perUserLimit > 0 && req.user.hasRealUUID) {
     let userUsedCount = 0;
     const userCountRes = await executeQuery('SELECT COUNT(*) as count FROM coupon_usage WHERE coupon_id = $1 AND user_id = $2', [coupon.id, req.user.id]);
     if (userCountRes) {
@@ -1973,6 +1993,11 @@ app.post('/api/coupons/validate', authenticateToken, async (req, res) => {
     } else {
       userUsedCount = dbFallback.coupon_usage.filter(cu => cu.coupon_id === coupon.id && cu.user_id === req.user.id).length;
     }
+    if (userUsedCount >= perUserLimit) {
+      return res.json({ success: false, message: 'You have already reached the limit for this coupon' });
+    }
+  } else if (perUserLimit > 0) {
+    const userUsedCount = dbFallback.coupon_usage.filter(cu => cu.coupon_id === coupon.id && cu.user_id === req.user.id).length;
     if (userUsedCount >= perUserLimit) {
       return res.json({ success: false, message: 'You have already reached the limit for this coupon' });
     }
@@ -1996,7 +2021,7 @@ app.post('/api/coupons/validate', authenticateToken, async (req, res) => {
 
   res.json({
     success: true,
-    message: `Coupon applied successfully! You saved ₹${discountAmount.toStringAsFixed(0)}`,
+    message: `Coupon applied successfully! You saved ₹${discountAmount.toFixed(0)}`,
     coupon,
     discountAmount
   });
@@ -2007,11 +2032,13 @@ app.post('/api/coupons/use', authenticateToken, async (req, res) => {
   const { coupon_id, order_id, discount_saved } = req.body;
   if (!coupon_id || !order_id) return res.status(400).json({ message: 'coupon_id and order_id are required' });
 
-  const dbResult = await executeQuery(
-    'INSERT INTO coupon_usage (coupon_id, user_id, order_id, discount_saved) VALUES ($1,$2,$3,$4) RETURNING *',
-    [coupon_id, req.user.id, order_id, discount_saved || 0]
-  );
-  if (dbResult) return res.json(dbResult[0]);
+  if (req.user.hasRealUUID) {
+    const dbResult = await executeQuery(
+      'INSERT INTO coupon_usage (coupon_id, user_id, order_id, discount_saved) VALUES ($1,$2,$3,$4) RETURNING *',
+      [coupon_id, req.user.id, order_id, discount_saved || 0]
+    );
+    if (dbResult) return res.json(dbResult[0]);
+  }
 
   const newUsage = { id: `usage-${Date.now()}`, coupon_id, user_id: req.user.id, order_id, discount_saved: parseFloat(discount_saved || 0), created_at: new Date() };
   dbFallback.coupon_usage.push(newUsage);
