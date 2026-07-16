@@ -2552,6 +2552,224 @@ app.post('/api/admin/adjust-credits', authenticateToken, requireAdmin, async (re
   res.json({ success: true, new_balance: dbFallback.wallets[user_id].balance });
 });
 
+// ─── MERCHANT REGISTRATION ROUTES ────────────────────────────────────────────
+
+// In-memory fallback for merchant requests
+if (!dbFallback.merchantRequests) dbFallback.merchantRequests = [];
+
+// POST /api/merchant/register — no auth required (user may not be logged in)
+app.post('/api/merchant/register', async (req, res) => {
+  const { business_name, owner_name, email, phone, address, gst, pan, password } = req.body;
+  if (!business_name || !owner_name || !email || !phone || !address) {
+    return res.status(400).json({ message: 'Business name, owner name, email, phone and address are required.' });
+  }
+
+  // Hash password if provided, otherwise use empty string
+  const passwordHash = password ? await bcrypt.hash(password, 10) : '';
+
+  // ── PostgreSQL path ──────────────────────────────────────────────────────
+  if (pool) {
+    try {
+      // Ensure password_hash column exists (idempotent — safe to re-run)
+      await pool.query(`ALTER TABLE merchant_requests ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT ''`);
+
+      // Check for duplicate email
+      const existCheck = await pool.query(
+        'SELECT id FROM merchant_requests WHERE email = $1',
+        [email]
+      );
+      if (existCheck.rows.length > 0) {
+        return res.status(400).json({ message: 'A merchant request with this email already exists.' });
+      }
+
+      // Insert — all 8 data columns explicitly named so column order never matters
+      const insertResult = await pool.query(
+        `INSERT INTO merchant_requests
+           (business_name, owner_name, email, phone, address, gst, pan, status, password_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'Pending', $8)
+         RETURNING id, business_name, owner_name, email, phone, address, gst, pan, status, created_at`,
+        [business_name, owner_name, email, phone, address, gst || '', pan || '', passwordHash]
+      );
+
+      console.log(`[MerchantRegister] Saved to DB: id=${insertResult.rows[0].id} email=${email}`);
+      return res.status(201).json(insertResult.rows[0]);
+
+    } catch (err) {
+      console.error('[MerchantRegister] DB error:', err.message);
+      // Do NOT fall through to in-memory when DB is connected — surface the error
+      return res.status(500).json({ message: 'Failed to save merchant request. Please try again.' });
+    }
+  }
+
+  // ── In-memory fallback (DB unavailable) ─────────────────────────────────
+  const dupFallback = dbFallback.merchantRequests.find(r => r.email === email);
+  if (dupFallback) return res.status(400).json({ message: 'A merchant request with this email already exists.' });
+
+  const newRequest = {
+    id: `mr-${Date.now()}`,
+    business_name,
+    owner_name,
+    email,
+    phone,
+    address,
+    gst: gst || '',
+    pan: pan || '',
+    status: 'Pending',
+    password_hash: passwordHash,
+    created_at: new Date(),
+  };
+  dbFallback.merchantRequests.push(newRequest);
+  console.log(`[MerchantRegister] Saved to in-memory fallback: id=${newRequest.id} email=${email}`);
+  const { password_hash: _h, ...safeNew } = newRequest;
+  res.status(201).json(safeNew);
+});
+
+// POST /api/merchant/login — only Approved merchants can log in
+app.post('/api/merchant/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) return res.status(400).json({ message: 'Email and password are required.' });
+
+  let merchant = null;
+
+  // ── PostgreSQL path ──────────────────────────────────────────────────────
+  if (pool) {
+    try {
+      const rows = await pool.query('SELECT * FROM merchant_requests WHERE email = $1', [email]);
+      merchant = rows.rows[0] || null;
+    } catch (err) {
+      console.error('[MerchantLogin] DB error:', err.message);
+      return res.status(500).json({ message: 'Server error. Please try again.' });
+    }
+  }
+
+  // ── In-memory fallback ───────────────────────────────────────────────────
+  if (!merchant) {
+    merchant = dbFallback.merchantRequests.find(r => r.email === email) || null;
+  }
+
+  if (!merchant) return res.status(400).json({ message: 'No merchant account found with this email.' });
+
+  if (merchant.status === 'Pending') {
+    return res.status(403).json({
+      message: 'Your merchant application is still under review. Please wait for admin approval.',
+      status: 'Pending',
+    });
+  }
+  if (merchant.status === 'Rejected') {
+    return res.status(403).json({
+      message: 'Your merchant application has been rejected. Please contact support.',
+      status: 'Rejected',
+    });
+  }
+
+  // Approved — verify password
+  if (merchant.password_hash) {
+    const match = await bcrypt.compare(password, merchant.password_hash);
+    if (!match) return res.status(400).json({ message: 'Invalid email or password.' });
+  }
+
+  const token = jwt.sign(
+    { id: merchant.id, name: merchant.owner_name, email: merchant.email, role: 'merchant', business_name: merchant.business_name },
+    JWT_SECRET
+  );
+  res.json({
+    token,
+    user: { id: merchant.id, name: merchant.owner_name, email: merchant.email, role: 'merchant', business_name: merchant.business_name, status: merchant.status },
+  });
+});
+
+// GET /api/merchant/status — check merchant request status by email
+app.get('/api/merchant/status', async (req, res) => {
+  const { email } = req.query;
+  if (!email) return res.status(400).json({ message: 'email query param required' });
+
+  if (pool) {
+    try {
+      const result = await pool.query(
+        'SELECT id, business_name, owner_name, email, status, created_at FROM merchant_requests WHERE email = $1',
+        [email]
+      );
+      if (result.rows[0]) return res.json(result.rows[0]);
+      return res.status(404).json({ message: 'No merchant request found.' });
+    } catch (err) {
+      console.error('[MerchantStatus] DB error:', err.message);
+      return res.status(500).json({ message: 'Server error.' });
+    }
+  }
+  const m = dbFallback.merchantRequests.find(r => r.email === email);
+  if (!m) return res.status(404).json({ message: 'No merchant request found.' });
+  res.json({ id: m.id, business_name: m.business_name, owner_name: m.owner_name, email: m.email, status: m.status, created_at: m.created_at });
+});
+
+// GET /api/admin/merchant-requests — admin only
+app.get('/api/admin/merchant-requests', authenticateToken, requireAdmin, async (req, res) => {
+  if (pool) {
+    try {
+      const result = await pool.query(
+        'SELECT id, business_name, owner_name, email, phone, address, gst, pan, status, created_at FROM merchant_requests ORDER BY created_at DESC'
+      );
+      return res.json(result.rows);
+    } catch (err) {
+      console.error('[Admin MerchantRequests] DB error:', err.message);
+      return res.status(500).json({ message: 'Failed to fetch merchant requests.' });
+    }
+  }
+  // In-memory fallback
+  res.json(dbFallback.merchantRequests.map(({ password_hash: _, ...r }) => r));
+});
+
+// PUT /api/admin/merchant-request/:id/approve — admin only
+app.put('/api/admin/merchant-request/:id/approve', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  if (pool && isValidUUID(id)) {
+    try {
+      const result = await pool.query(
+        `UPDATE merchant_requests SET status = 'Approved' WHERE id = $1
+         RETURNING id, business_name, owner_name, email, phone, address, gst, pan, status, created_at`,
+        [id]
+      );
+      if (result.rows[0]) return res.json(result.rows[0]);
+      return res.status(404).json({ message: 'Request not found' });
+    } catch (err) {
+      console.error('[Admin Approve] DB error:', err.message);
+      return res.status(500).json({ message: 'Failed to approve request.' });
+    }
+  }
+  // In-memory fallback
+  const req_ = dbFallback.merchantRequests.find(r => r.id === id);
+  if (!req_) return res.status(404).json({ message: 'Request not found' });
+  req_.status = 'Approved';
+  const { password_hash: _, ...safe } = req_;
+  res.json(safe);
+});
+
+// PUT /api/admin/merchant-request/:id/reject — admin only
+app.put('/api/admin/merchant-request/:id/reject', authenticateToken, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  if (pool && isValidUUID(id)) {
+    try {
+      const result = await pool.query(
+        `UPDATE merchant_requests SET status = 'Rejected' WHERE id = $1
+         RETURNING id, business_name, owner_name, email, phone, address, gst, pan, status, created_at`,
+        [id]
+      );
+      if (result.rows[0]) return res.json(result.rows[0]);
+      return res.status(404).json({ message: 'Request not found' });
+    } catch (err) {
+      console.error('[Admin Reject] DB error:', err.message);
+      return res.status(500).json({ message: 'Failed to reject request.' });
+    }
+  }
+  // In-memory fallback
+  const req_ = dbFallback.merchantRequests.find(r => r.id === id);
+  if (!req_) return res.status(404).json({ message: 'Request not found' });
+  req_.status = 'Rejected';
+  const { password_hash: _, ...safe } = req_;
+  res.json(safe);
+});
+
+// ─── END MERCHANT ROUTES ──────────────────────────────────────────────────────
+
 // ─── STARTUP: Connect to DB then create tables, then start server ─────────────
 async function runStartup() {
   await initPool(); // test DB connection, set pool + dbConnected
@@ -2655,6 +2873,22 @@ async function runStartup() {
       // reference the products table. Making the FK nullable lets the order
       // still be recorded without a DB-level foreign-key violation.
       `ALTER TABLE order_items ALTER COLUMN product_id DROP NOT NULL`,
+      // ── Merchant Requests table ───────────────────────────────────────────
+      `CREATE TABLE IF NOT EXISTS merchant_requests (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        business_name VARCHAR(255) NOT NULL,
+        owner_name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        phone VARCHAR(30) NOT NULL,
+        address TEXT NOT NULL,
+        gst VARCHAR(20) DEFAULT '',
+        pan VARCHAR(20) DEFAULT '',
+        status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected')),
+        password_hash TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // Back-fill password_hash column for older installs
+      `ALTER TABLE merchant_requests ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT ''`,
     ];
 
     for (const q of startupQueries) {

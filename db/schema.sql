@@ -128,6 +128,20 @@ CREATE TABLE nxl_transactions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 14. Merchant Requests Table
+CREATE TABLE merchant_requests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    business_name VARCHAR(255) NOT NULL,
+    owner_name VARCHAR(255) NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    phone VARCHAR(30) NOT NULL,
+    address TEXT NOT NULL,
+    gst VARCHAR(20) DEFAULT '',
+    pan VARCHAR(20) DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 13. User Addresses Table
 CREATE TABLE user_addresses (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
