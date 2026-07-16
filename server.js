@@ -2552,6 +2552,290 @@ app.post('/api/admin/adjust-credits', authenticateToken, requireAdmin, async (re
   res.json({ success: true, new_balance: dbFallback.wallets[user_id].balance });
 });
 
+// ─── MERCHANT QR & PAYMENT ROUTES ────────────────────────────────────────────
+
+if (!dbFallback.merchantQRs)           dbFallback.merchantQRs = [];
+if (!dbFallback.merchantTransactions)  dbFallback.merchantTransactions = [];
+
+// Helper: generate a unique merchant_code  e.g. "MRC-A3F9B2"
+function generateMerchantCode() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = 'MRC-';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return code;
+}
+
+// ── GET /api/admin/merchants — list all approved merchants ────────────────────
+app.get('/api/admin/merchants', authenticateToken, requireAdmin, async (req, res) => {
+  if (pool) {
+    try {
+      // Join merchant_requests with merchant_qr to know who already has a QR
+      const r = await pool.query(
+        `SELECT mr.id, mr.business_name, mr.owner_name, mr.email, mr.phone, mr.status, mr.created_at,
+                mq.id AS qr_id, mq.merchant_code, mq.qr_data, mq.qr_status, mq.created_at AS qr_created_at
+         FROM merchant_requests mr
+         LEFT JOIN merchant_qr mq ON mq.merchant_id = mr.id
+         WHERE mr.status = 'Approved'
+         ORDER BY mr.created_at DESC`
+      );
+      return res.json(r.rows);
+    } catch (e) {
+      console.error('[Admin Merchants]', e.message);
+      return res.status(500).json({ message: 'Failed to fetch merchants' });
+    }
+  }
+  // Fallback
+  const approved = dbFallback.merchantRequests.filter(m => m.status === 'Approved').map(m => {
+    const qr = dbFallback.merchantQRs.find(q => q.merchant_id === m.id) || null;
+    return { ...m, qr_id: qr?.id || null, merchant_code: qr?.merchant_code || null, qr_data: qr?.qr_data || null, qr_status: qr?.qr_status || null, qr_created_at: qr?.created_at || null };
+  });
+  res.json(approved);
+});
+
+// ── POST /api/admin/merchant/:id/generate-qr — generate or regenerate QR ─────
+app.post('/api/admin/merchant/:id/generate-qr', authenticateToken, requireAdmin, async (req, res) => {
+  const merchant_id = req.params.id;
+
+  // Verify merchant is approved
+  let merchant = null;
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT * FROM merchant_requests WHERE id = $1', [merchant_id]);
+      merchant = r.rows[0] || null;
+    } catch (e) { console.error('[GenQR] DB lookup:', e.message); }
+  }
+  if (!merchant) merchant = dbFallback.merchantRequests.find(m => m.id === merchant_id) || null;
+  if (!merchant) return res.status(404).json({ message: 'Merchant not found' });
+  if (merchant.status !== 'Approved') return res.status(400).json({ message: 'Merchant is not approved' });
+
+  const merchant_code = generateMerchantCode();
+  // qr_data is the string the QR image encodes — contains merchant_id and merchant_code
+  const qr_data = JSON.stringify({
+    type:          'nexora_merchant_payment',
+    merchant_id:   merchant_id,
+    merchant_code: merchant_code,
+    business_name: merchant.business_name,
+  });
+  const qr_status = 'Active';
+
+  if (pool) {
+    try {
+      // Upsert — one QR per merchant
+      const r = await pool.query(
+        `INSERT INTO merchant_qr (merchant_id, merchant_code, qr_data, status)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (merchant_id)
+         DO UPDATE SET merchant_code = $2, qr_data = $3, status = $4, created_at = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [merchant_id, merchant_code, qr_data, qr_status]
+      );
+      console.log(`[GenQR] QR saved for merchant ${merchant_id}: code=${merchant_code}`);
+      return res.json(r.rows[0]);
+    } catch (e) {
+      console.error('[GenQR] DB upsert:', e.message);
+      return res.status(500).json({ message: 'Failed to save QR: ' + e.message });
+    }
+  }
+  // Fallback
+  const idx = dbFallback.merchantQRs.findIndex(q => q.merchant_id === merchant_id);
+  const qrRec = { id: `qr-${Date.now()}`, merchant_id, merchant_code, qr_data, status: qr_status, created_at: new Date() };
+  if (idx >= 0) dbFallback.merchantQRs[idx] = qrRec;
+  else dbFallback.merchantQRs.push(qrRec);
+  res.json(qrRec);
+});
+
+// ── GET /api/merchant/qr — merchant fetches their own QR (uses JWT identity) ──
+app.get('/api/merchant/qr', authenticateToken, async (req, res) => {
+  const merchant_id = req.user.id;
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT * FROM merchant_qr WHERE merchant_id = $1', [merchant_id]);
+      if (r.rows[0]) return res.json(r.rows[0]);
+      return res.status(404).json({ message: 'No QR found for this merchant' });
+    } catch (e) {
+      console.error('[MerchantQR]', e.message);
+      return res.status(500).json({ message: 'Failed to fetch QR' });
+    }
+  }
+  const qr = dbFallback.merchantQRs.find(q => q.merchant_id === merchant_id);
+  if (!qr) return res.status(404).json({ message: 'No QR found for this merchant' });
+  res.json(qr);
+});
+
+// ── GET /api/admin/merchant-qr/generate — kept for backward compat ───────────
+app.post('/api/admin/merchant-qr/generate', authenticateToken, requireAdmin, async (req, res) => {
+  // Redirect to new canonical route logic
+  const { merchant_id } = req.body;
+  if (!merchant_id) return res.status(400).json({ message: 'merchant_id required' });
+  req.params = { id: merchant_id };
+  // Re-use logic by forwarding to the new route handler via internal call
+  try {
+    let merchant = null;
+    if (pool) {
+      const r = await pool.query('SELECT * FROM merchant_requests WHERE id = $1', [merchant_id]);
+      merchant = r.rows[0] || null;
+    }
+    if (!merchant) merchant = dbFallback.merchantRequests.find(m => m.id === merchant_id) || null;
+    if (!merchant) return res.status(404).json({ message: 'Merchant not found' });
+    if (merchant.status !== 'Approved') return res.status(400).json({ message: 'Merchant is not approved' });
+
+    const merchant_code = generateMerchantCode();
+    const qr_data = JSON.stringify({ type: 'nexora_merchant_payment', merchant_id, merchant_code, business_name: merchant.business_name });
+    if (pool) {
+      const r = await pool.query(
+        `INSERT INTO merchant_qr (merchant_id, merchant_code, qr_data, status)
+         VALUES ($1, $2, $3, 'Active')
+         ON CONFLICT (merchant_id)
+         DO UPDATE SET merchant_code = $2, qr_data = $3, status = 'Active', created_at = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [merchant_id, merchant_code, qr_data]
+      );
+      return res.json(r.rows[0]);
+    }
+    const idx = dbFallback.merchantQRs.findIndex(q => q.merchant_id === merchant_id);
+    const qrRec = { id: `qr-${Date.now()}`, merchant_id, merchant_code, qr_data, status: 'Active', created_at: new Date() };
+    if (idx >= 0) dbFallback.merchantQRs[idx] = qrRec; else dbFallback.merchantQRs.push(qrRec);
+    res.json(qrRec);
+  } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// ── GET /api/merchant-qr/:merchant_id — kept for backward compat ─────────────
+app.get('/api/merchant-qr/:merchant_id', authenticateToken, async (req, res) => {
+  const { merchant_id } = req.params;
+  if (pool) {
+    try {
+      const r = await pool.query('SELECT * FROM merchant_qr WHERE merchant_id = $1', [merchant_id]);
+      if (r.rows[0]) return res.json(r.rows[0]);
+      return res.status(404).json({ message: 'No QR found for this merchant' });
+    } catch (e) { console.error('[GetQR-compat]', e.message); }
+  }
+  const qr = dbFallback.merchantQRs.find(q => q.merchant_id === merchant_id);
+  if (!qr) return res.status(404).json({ message: 'No QR found for this merchant' });
+  res.json(qr);
+});
+
+// ── Merchant: Dashboard stats ─────────────────────────────────────────────────
+app.get('/api/merchant/dashboard', authenticateToken, async (req, res) => {
+  if (req.user.role !== 'merchant') return res.status(403).json({ message: 'Merchant access required' });
+  const merchantId = req.user.id;
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+
+  if (pool) {
+    try {
+      const txRes = await pool.query(
+        'SELECT * FROM merchant_transactions WHERE merchant_id = $1 ORDER BY created_at DESC',
+        [merchantId]
+      );
+      const txs = txRes.rows;
+      const total       = txs.reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+      const todayTotal  = txs.filter(t => new Date(t.created_at) >= new Date(todayStart)).reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+      const razorpayTot = txs.reduce((s, t) => s + parseFloat(t.razorpay_amount || 0), 0);
+      const nxlTot      = txs.reduce((s, t) => s + parseFloat(t.nxl_amount || 0), 0);
+      return res.json({ total_received: total, today_collection: todayTotal, razorpay_received: razorpayTot, nxl_received: nxlTot, transactions: txs });
+    } catch (e) { console.error('[MerchantDashboard]', e.message); }
+  }
+  // Fallback
+  const txs = dbFallback.merchantTransactions.filter(t => t.merchant_id === merchantId);
+  const total      = txs.reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+  const todayTotal = txs.filter(t => new Date(t.created_at) >= new Date(todayStart)).reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+  const rzpTot     = txs.reduce((s, t) => s + parseFloat(t.razorpay_amount || 0), 0);
+  const nxlTot     = txs.reduce((s, t) => s + parseFloat(t.nxl_amount || 0), 0);
+  res.json({ total_received: total, today_collection: todayTotal, razorpay_received: rzpTot, nxl_received: nxlTot, transactions: txs });
+});
+
+// ── Public: Resolve merchant info from QR merchant_id ────────────────────────
+app.get('/api/merchant/info/:merchant_id', async (req, res) => {
+  const { merchant_id } = req.params;
+  if (pool) {
+    try {
+      const r = await pool.query(
+        'SELECT id, business_name, owner_name, email, phone, status FROM merchant_requests WHERE id = $1 AND status = $2',
+        [merchant_id, 'Approved']
+      );
+      if (r.rows[0]) return res.json(r.rows[0]);
+      return res.status(404).json({ message: 'Merchant not found or not approved' });
+    } catch (e) { console.error('[MerchantInfo]', e.message); }
+  }
+  const m = dbFallback.merchantRequests.find(r => r.id === merchant_id && r.status === 'Approved');
+  if (!m) return res.status(404).json({ message: 'Merchant not found or not approved' });
+  res.json({ id: m.id, business_name: m.business_name, owner_name: m.owner_name, email: m.email, phone: m.phone, status: m.status });
+});
+
+// ── Customer: Create Razorpay order for merchant payment ─────────────────────
+app.post('/api/merchant/payment/create-order', authenticateToken, async (req, res) => {
+  const { merchant_id, amount_inr } = req.body;
+  if (!merchant_id || !amount_inr || parseFloat(amount_inr) <= 0) {
+    return res.status(400).json({ message: 'merchant_id and amount_inr required' });
+  }
+  if (!razorpay) return res.status(503).json({ message: 'Payment gateway not configured' });
+  try {
+    const order = await razorpay.orders.create({
+      amount: Math.round(parseFloat(amount_inr) * 100),
+      currency: 'INR',
+      receipt: `mp_${merchant_id.substring(0,8)}_${Date.now()}`,
+      payment_capture: 1,
+    });
+    res.json({ order_id: order.id, amount: order.amount, key_id: process.env.RAZORPAY_KEY_ID });
+  } catch (e) { res.status(500).json({ message: 'Failed to create payment order', error: e.message }); }
+});
+
+// ── Customer: Verify payment and credit merchant ──────────────────────────────
+app.post('/api/merchant/payment/verify', authenticateToken, async (req, res) => {
+  const { merchant_id, razorpay_order_id, razorpay_payment_id, razorpay_signature, razorpay_amount, nxl_amount, total_amount } = req.body;
+  if (!merchant_id || !total_amount) return res.status(400).json({ message: 'merchant_id and total_amount required' });
+
+  // Verify Razorpay signature if Razorpay was used
+  if (razorpay_amount > 0 && razorpay_order_id && razorpay_payment_id && razorpay_signature) {
+    const expectedSig = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '')
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`).digest('hex');
+    if (expectedSig !== razorpay_signature) {
+      return res.status(400).json({ message: 'Payment verification failed. Invalid signature.' });
+    }
+  }
+
+  const customerId = req.user.id;
+
+  // Deduct NXL from customer wallet
+  if (nxl_amount > 0 && req.user.hasRealUUID) {
+    if (pool) {
+      try {
+        const walletRes = await pool.query(
+          'UPDATE nxl_wallet SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1 RETURNING id, balance',
+          [parseFloat(nxl_amount), customerId]
+        );
+        if (!walletRes.rows[0]) return res.status(400).json({ message: 'Insufficient NXL balance' });
+        await pool.query(
+          `INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description)
+           VALUES ($1, $2, 'REDEEMED', $3)`,
+          [walletRes.rows[0].id, parseFloat(nxl_amount), `Paid to merchant ${merchant_id.substring(0,8)}`]
+        );
+      } catch (e) { console.error('[MerchantPayVerify] NXL deduct:', e.message); return res.status(500).json({ message: 'Failed to deduct NXL' }); }
+    } else {
+      const w = dbFallback.wallets[customerId];
+      if (!w || w.balance < parseFloat(nxl_amount)) return res.status(400).json({ message: 'Insufficient NXL balance' });
+      w.balance -= parseFloat(nxl_amount);
+      w.transactions.unshift({ id: `tx-${Date.now()}`, amount: parseFloat(nxl_amount), transaction_type: 'REDEEMED', description: `Paid to merchant ${merchant_id.substring(0,8)}`, created_at: new Date() });
+    }
+  }
+
+  // Record merchant transaction
+  const txData = { merchant_id, customer_id: customerId, total_amount: parseFloat(total_amount), razorpay_amount: parseFloat(razorpay_amount || 0), nxl_amount: parseFloat(nxl_amount || 0), razorpay_payment_id: razorpay_payment_id || '', razorpay_order_id: razorpay_order_id || '', payment_status: 'Success' };
+  if (pool) {
+    try {
+      const r = await pool.query(
+        `INSERT INTO merchant_transactions (merchant_id, customer_id, total_amount, razorpay_amount, nxl_amount, razorpay_payment_id, razorpay_order_id, payment_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'Success') RETURNING *`,
+        [txData.merchant_id, txData.customer_id, txData.total_amount, txData.razorpay_amount, txData.nxl_amount, txData.razorpay_payment_id, txData.razorpay_order_id]
+      );
+      return res.json({ success: true, transaction: r.rows[0] });
+    } catch (e) { console.error('[MerchantPayVerify] Insert tx:', e.message); }
+  }
+  const newTx = { id: `mtx-${Date.now()}`, ...txData, created_at: new Date() };
+  dbFallback.merchantTransactions.push(newTx);
+  res.json({ success: true, transaction: newTx });
+});
+
 // ─── MERCHANT REGISTRATION ROUTES ────────────────────────────────────────────
 
 // In-memory fallback for merchant requests
@@ -2889,6 +3173,36 @@ async function runStartup() {
       )`,
       // Back-fill password_hash column for older installs
       `ALTER TABLE merchant_requests ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT ''`,
+      // ── Merchant QR Codes table ───────────────────────────────────────────
+      `CREATE TABLE IF NOT EXISTS merchant_qr (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        merchant_id TEXT NOT NULL UNIQUE,
+        merchant_code VARCHAR(20) NOT NULL,
+        qr_data TEXT NOT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'Active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // Back-compat: also create old name if someone already ran previous migrations
+      `CREATE TABLE IF NOT EXISTS merchant_qr_codes (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        merchant_id TEXT NOT NULL UNIQUE,
+        qr_data TEXT NOT NULL,
+        qr_status VARCHAR(20) NOT NULL DEFAULT 'Active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // ── Merchant Transactions table ───────────────────────────────────────
+      `CREATE TABLE IF NOT EXISTS merchant_transactions (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        merchant_id TEXT NOT NULL,
+        customer_id TEXT NOT NULL,
+        total_amount NUMERIC(10,2) NOT NULL,
+        razorpay_amount NUMERIC(10,2) NOT NULL DEFAULT 0,
+        nxl_amount NUMERIC(10,2) NOT NULL DEFAULT 0,
+        razorpay_payment_id TEXT DEFAULT '',
+        razorpay_order_id TEXT DEFAULT '',
+        payment_status VARCHAR(20) NOT NULL DEFAULT 'Success',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )`,
     ];
 
     for (const q of startupQueries) {
