@@ -139,6 +139,8 @@ CREATE TABLE merchant_requests (
     gst VARCHAR(20) DEFAULT '',
     pan VARCHAR(20) DEFAULT '',
     status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected')),
+    total_received NUMERIC(10,2) DEFAULT 0.00,
+    today_collection NUMERIC(10,2) DEFAULT 0.00,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -783,15 +783,15 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
       const orderIds = dbResult.map(o => o.id).filter(id => isValidUUID(id));
       const allItems = orderIds.length > 0
         ? await executeQuery(
-            `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price,
+          `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price,
                     COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS name,
                     COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS product_name,
                     COALESCE(NULLIF(oi.image_url, ''),    p.image_url, '') AS image_url
              FROM order_items oi
              LEFT JOIN products p ON oi.product_id = p.id
              WHERE oi.order_id = ANY($1::uuid[])`,
-            [orderIds]
-          )
+          [orderIds]
+        )
         : [];
       const itemsByOrder = {};
       for (const item of (allItems || [])) {
@@ -822,7 +822,7 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
 });
 
 app.post('/api/orders', authenticateToken, async (req, res) => {
-  const { items, total_amount, discount_amount, net_amount, shipping_address, payment_method, redeem_credits } = req.body;
+  const { items, total_amount, discount_amount, net_amount, shipping_address, payment_method, redeem_credits, merchant_id, razorpay_payment_id } = req.body;
 
   // Only attempt DB insert when the user has a real UUID
   if (req.user.hasRealUUID) {
@@ -834,7 +834,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     if (dbOrder && dbOrder[0]) {
       const order = dbOrder[0];
       for (const item of items) {
-        const snapshotName  = (item.name || item.product_name || '').toString().trim();
+        const snapshotName = (item.name || item.product_name || '').toString().trim();
         const snapshotImage = (item.image_url || '').toString().trim();
 
         if (isValidUUID(item.product_id)) {
@@ -857,7 +857,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         if (wallet && wallet[0]) {
           await executeQuery(
             "INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'REDEEMED', $3)",
-            [wallet[0].id, redeem_credits, `Discount on Order #${order.id.substring(0,8)}`]
+            [wallet[0].id, redeem_credits, `Discount on Order #${order.id.substring(0, 8)}`]
           );
         }
       }
@@ -867,7 +867,7 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         if (wallet && wallet[0]) {
           await executeQuery(
             "INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description) VALUES ($1, $2, 'EARNED', $3)",
-            [wallet[0].id, earnedCredits, `Earned from Order #${order.id.substring(0,8)}`]
+            [wallet[0].id, earnedCredits, `Earned from Order #${order.id.substring(0, 8)}`]
           );
         }
       }
@@ -875,6 +875,15 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         "INSERT INTO payments (order_id, payment_method, payment_status, amount_paid) VALUES ($1, $2, 'Success', $3)",
         [order.id, payment_method, net_amount]
       );
+
+      // Link merchant transaction to the order
+      if (merchant_id && razorpay_payment_id) {
+        await executeQuery(
+          "UPDATE merchant_transactions SET order_id = $1 WHERE razorpay_payment_id = $2",
+          [order.id, razorpay_payment_id]
+        );
+      }
+
       await executeQuery('DELETE FROM cart WHERE user_id = $1', [req.user.id]);
 
       const savedItems = await executeQuery(
@@ -888,21 +897,15 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
         [order.id]
       );
 
-      return res.status(201).json({
+      const responseOrder = {
         ...order,
-        items: savedItems || items.map(item => ({
-          product_id:   item.product_id,
-          name:         item.name || item.product_name || '',
-          product_name: item.name || item.product_name || '',
-          quantity:     item.quantity,
-          price:        item.price,
-          image_url:    item.image_url || '',
-        }))
-      });
+        items: savedItems
+      };
+      return res.status(201).json(responseOrder);
     }
   }
 
-  // Fallback (DB unavailable or non-UUID user)
+  // Fallback / in-memory mode
   const newOrder = {
     id: `ord-${Date.now()}`,
     user_id: req.user.id,
@@ -912,33 +915,31 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     status: 'Pending',
     shipping_address,
     created_at: new Date(),
-    items
+    items: items.map(i => ({ product_id: i.product_id, quantity: i.quantity, price: i.price, name: i.name || i.product_name, image_url: i.image_url }))
   };
 
   if (redeem_credits && redeem_credits > 0) {
-    if (dbFallback.wallets[req.user.id]) {
-      dbFallback.wallets[req.user.id].balance -= parseFloat(redeem_credits);
-      dbFallback.wallets[req.user.id].transactions.unshift({
-        id: `tx-${Date.now()}-red`,
-        amount: parseFloat(redeem_credits),
-        transaction_type: 'REDEEMED',
-        description: `Discount on Order #${newOrder.id.substring(0,8)}`,
-        created_at: new Date()
-      });
-    }
+    dbFallback.wallets[req.user.id].balance = Math.max(0, dbFallback.wallets[req.user.id].balance - redeem_credits);
+    dbFallback.wallets[req.user.id].transactions.unshift({
+      id: `tx-${Date.now()}-redeem`,
+      amount: parseFloat(redeem_credits),
+      transaction_type: 'REDEEMED',
+      description: `Discount on Order #${newOrder.id.substring(0, 8)}`,
+      created_at: new Date()
+    });
   }
 
   const earnedCredits = Math.floor(net_amount / 100) * 5;
   if (earnedCredits > 0) {
     if (!dbFallback.wallets[req.user.id]) {
-      dbFallback.wallets[req.user.id] = { balance: 0.00, transactions: [] };
+      dbFallback.wallets[req.user.id] = { balance: 0, transactions: [] };
     }
     dbFallback.wallets[req.user.id].balance += earnedCredits;
     dbFallback.wallets[req.user.id].transactions.unshift({
       id: `tx-${Date.now()}-earn`,
       amount: parseFloat(earnedCredits),
       transaction_type: 'EARNED',
-      description: `Earned from Order #${newOrder.id.substring(0,8)}`,
+      description: `Earned from Order #${newOrder.id.substring(0, 8)}`,
       created_at: new Date()
     });
   }
@@ -946,6 +947,14 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
   for (const item of items) {
     const prod = dbFallback.products.find(p => p.id === item.product_id);
     if (prod) prod.stock = Math.max(0, prod.stock - item.quantity);
+  }
+
+  // Link in-memory fallback
+  if (merchant_id && razorpay_payment_id) {
+    const fallbackTx = dbFallback.merchantTransactions.find(t => t.razorpay_payment_id === razorpay_payment_id);
+    if (fallbackTx) {
+      fallbackTx.order_id = newOrder.id;
+    }
   }
 
   dbFallback.orders.unshift(newOrder);
@@ -1031,7 +1040,7 @@ app.post('/api/addresses', authenticateToken, async (req, res) => {
     let dbResult = await executeQuery(
       `INSERT INTO user_addresses (user_id, label, full_name, phone, address_line1, address_line2, city, state, pincode, is_default)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [req.user.id, label||'Home', full_name, phone||'', address_line1, address_line2||'', city, state, pincode, is_default||false]
+      [req.user.id, label || 'Home', full_name, phone || '', address_line1, address_line2 || '', city, state, pincode, is_default || false]
     );
     if (dbResult) return res.status(201).json(dbResult[0]);
   }
@@ -1039,7 +1048,7 @@ app.post('/api/addresses', authenticateToken, async (req, res) => {
   if (is_default && dbFallback.addresses[req.user.id]) {
     dbFallback.addresses[req.user.id].forEach(a => a.is_default = false);
   }
-  const newAddr = { id: `addr-${Date.now()}`, user_id: req.user.id, label: label||'Home', full_name, phone: phone||'', address_line1, address_line2: address_line2||'', city, state, pincode, is_default: is_default||false, created_at: new Date() };
+  const newAddr = { id: `addr-${Date.now()}`, user_id: req.user.id, label: label || 'Home', full_name, phone: phone || '', address_line1, address_line2: address_line2 || '', city, state, pincode, is_default: is_default || false, created_at: new Date() };
   if (!dbFallback.addresses[req.user.id]) dbFallback.addresses[req.user.id] = [];
   dbFallback.addresses[req.user.id].push(newAddr);
   res.status(201).json(newAddr);
@@ -1273,7 +1282,7 @@ app.put('/api/vendor/profile', authenticateToken, async (req, res) => {
         [req.user.id, store_name || '', address || '']
       );
     }
-    const userRow   = await executeQuery('SELECT id, name, email, phone FROM users WHERE id = $1', [req.user.id]);
+    const userRow = await executeQuery('SELECT id, name, email, phone FROM users WHERE id = $1', [req.user.id]);
     const vendorRow = await executeQuery('SELECT store_name, address FROM vendors WHERE user_id = $1', [req.user.id]);
     if (userRow) {
       const u = userRow[0] || {};
@@ -1288,9 +1297,9 @@ app.put('/api/vendor/profile', authenticateToken, async (req, res) => {
   const u = dbFallback.users.find(u => u.id === req.user.id);
   if (u) {
     if (store_name) u.store_name = store_name;
-    if (phone)      u.phone      = phone;
-    if (address)    u.address    = address;
-    if (photo_url)  u.photo_url  = photo_url;
+    if (phone) u.phone = phone;
+    if (address) u.address = address;
+    if (photo_url) u.photo_url = photo_url;
   }
   res.json({
     id: req.user.id, name: u?.name || '', email: u?.email || '',
@@ -1333,7 +1342,7 @@ app.get('/api/vendor/stats', authenticateToken, async (req, res) => {
     const orderIds = orderRows.map(o => o.id).filter(id => isValidUUID(id));
     const itemRows = orderIds.length > 0
       ? await executeQuery(
-          `SELECT
+        `SELECT
               oi.order_id,
               oi.product_id,
               oi.quantity,
@@ -1344,8 +1353,8 @@ app.get('/api/vendor/stats', authenticateToken, async (req, res) => {
            LEFT JOIN products p ON p.id = oi.product_id
            WHERE oi.order_id = ANY($1::uuid[])
              AND (p.vendor_id = $2 OR oi.product_id IS NULL)`,
-          [orderIds, vendorId]
-        )
+        [orderIds, vendorId]
+      )
       : [];
 
     const itemsByOrder = {};
@@ -1367,14 +1376,14 @@ app.get('/api/vendor/stats', authenticateToken, async (req, res) => {
       ? vendorProductsDb
       : dbFallback.products.filter(p => p.vendor_id === vendorId);
 
-    const totalOrders     = enriched.length;
-    const pendingOrders   = enriched.filter(o => o.status === 'Pending').length;
+    const totalOrders = enriched.length;
+    const pendingOrders = enriched.filter(o => o.status === 'Pending').length;
     const deliveredOrders = enriched.filter(o => o.status === 'Delivered');
-    const totalSales      = deliveredOrders.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
-    const productCount    = vendorProducts.length;
-    const outOfStock      = vendorProducts.filter(p => parseInt(p.stock || 0) <= 0).length;
+    const totalSales = deliveredOrders.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
+    const productCount = vendorProducts.length;
+    const outOfStock = vendorProducts.filter(p => parseInt(p.stock || 0) <= 0).length;
     // Total inventory value = SUM(price × stock) across all vendor products
-    const inventoryValue  = vendorProducts.reduce(
+    const inventoryValue = vendorProducts.reduce(
       (s, p) => s + (parseFloat(p.price || 0) * Math.max(0, parseInt(p.stock || 0))), 0
     );
 
@@ -1406,13 +1415,13 @@ app.get('/api/vendor/stats', authenticateToken, async (req, res) => {
   const vendorOrders = dbFallback.orders.filter(o =>
     Array.isArray(o.items) && o.items.some(i => vendorProdIds.has(i.product_id))
   );
-  const vendorProds  = dbFallback.products.filter(p => p.vendor_id === vendorId);
+  const vendorProds = dbFallback.products.filter(p => p.vendor_id === vendorId);
 
-  const totalSales   = vendorOrders.filter(o => o.status === 'Delivered').reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
-  const totalOrders  = vendorOrders.length;
-  const pendingOrders= vendorOrders.filter(o => o.status === 'Pending').length;
+  const totalSales = vendorOrders.filter(o => o.status === 'Delivered').reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
+  const totalOrders = vendorOrders.length;
+  const pendingOrders = vendorOrders.filter(o => o.status === 'Pending').length;
   const productCount = vendorProds.length;
-  const outOfStock   = vendorProds.filter(p => parseInt(p.stock) <= 0).length;
+  const outOfStock = vendorProds.filter(p => parseInt(p.stock) <= 0).length;
   const inventoryValue = vendorProds.reduce(
     (s, p) => s + (parseFloat(p.price || 0) * parseInt(p.stock || 0)), 0
   );
@@ -1477,7 +1486,7 @@ app.get('/api/vendor/earnings', authenticateToken, async (req, res) => {
     const orderIds = orderRows.map(o => o.id).filter(id => isValidUUID(id));
     const itemRows = orderIds.length > 0
       ? await executeQuery(
-          `SELECT
+        `SELECT
               oi.order_id,
               oi.product_id,
               oi.quantity,
@@ -1489,8 +1498,8 @@ app.get('/api/vendor/earnings', authenticateToken, async (req, res) => {
            LEFT JOIN products p ON p.id = oi.product_id
            WHERE oi.order_id = ANY($1::uuid[])
              AND (p.vendor_id = $2 OR oi.product_id IS NULL)`,
-          [orderIds, vendorId]
-        )
+        [orderIds, vendorId]
+      )
       : [];
 
     const itemsByOrder = {};
@@ -1504,9 +1513,9 @@ app.get('/api/vendor/earnings', authenticateToken, async (req, res) => {
     }));
 
     const completed = enriched.filter(o => o.status === 'Delivered');
-    const pending   = enriched.filter(o => !['Delivered','Cancelled','Returned'].includes(o.status));
+    const pending = enriched.filter(o => !['Delivered', 'Cancelled', 'Returned'].includes(o.status));
 
-    const totalEarnings   = completed.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
+    const totalEarnings = completed.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
     const pendingEarnings = pending.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
 
     const todayEarnings = completed
@@ -1547,9 +1556,9 @@ app.get('/api/vendor/earnings', authenticateToken, async (req, res) => {
     Array.isArray(o.items) && o.items.some(i => vendorProdIds.has(i.product_id))
   );
   const completed = orders.filter(o => o.status === 'Delivered');
-  const pending   = orders.filter(o => !['Delivered','Cancelled','Returned'].includes(o.status));
+  const pending = orders.filter(o => !['Delivered', 'Cancelled', 'Returned'].includes(o.status));
 
-  const totalEarnings   = completed.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
+  const totalEarnings = completed.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
   const pendingEarnings = pending.reduce((s, o) => s + parseFloat(o.net_amount || 0), 0);
 
   const todayEarnings = completed
@@ -1704,34 +1713,34 @@ const requireAdmin = (req, res, next) => {
 
 // Admin: Dashboard stats
 app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req, res) => {
-  const dbUsers      = await executeQuery('SELECT COUNT(*) as count FROM users WHERE role=\'customer\'');
-  const dbVendors    = await executeQuery('SELECT COUNT(*) as count FROM users WHERE role=\'vendor\'');
-  const dbProducts   = await executeQuery('SELECT COUNT(*) as count FROM products');
-  const dbOrders     = await executeQuery('SELECT COUNT(*) as count FROM orders');
-  const dbRevenue    = await executeQuery('SELECT COALESCE(SUM(amount_paid),0) as total FROM payments WHERE payment_status=\'Success\'');
-  const dbNxl        = await executeQuery('SELECT COALESCE(SUM(balance),0) as total FROM nxl_wallet');
+  const dbUsers = await executeQuery('SELECT COUNT(*) as count FROM users WHERE role=\'customer\'');
+  const dbVendors = await executeQuery('SELECT COUNT(*) as count FROM users WHERE role=\'vendor\'');
+  const dbProducts = await executeQuery('SELECT COUNT(*) as count FROM products');
+  const dbOrders = await executeQuery('SELECT COUNT(*) as count FROM orders');
+  const dbRevenue = await executeQuery('SELECT COALESCE(SUM(amount_paid),0) as total FROM payments WHERE payment_status=\'Success\'');
+  const dbNxl = await executeQuery('SELECT COALESCE(SUM(balance),0) as total FROM nxl_wallet');
 
   if (dbUsers) {
     return res.json({
       totalCustomers: parseInt(dbUsers[0]?.count || 0),
-      totalVendors:   parseInt(dbVendors[0]?.count || 0),
-      totalProducts:  parseInt(dbProducts[0]?.count || 0),
-      totalOrders:    parseInt(dbOrders[0]?.count || 0),
-      totalRevenue:   parseFloat(dbRevenue[0]?.total || 0),
-      totalNxl:       parseFloat(dbNxl[0]?.total || 0),
+      totalVendors: parseInt(dbVendors[0]?.count || 0),
+      totalProducts: parseInt(dbProducts[0]?.count || 0),
+      totalOrders: parseInt(dbOrders[0]?.count || 0),
+      totalRevenue: parseFloat(dbRevenue[0]?.total || 0),
+      totalNxl: parseFloat(dbNxl[0]?.total || 0),
     });
   }
   // Fallback stats from memory
   const customers = dbFallback.users.filter(u => u.role === 'customer').length;
-  const vendors   = dbFallback.users.filter(u => u.role === 'vendor').length;
-  const revenue   = dbFallback.orders.reduce((s, o) => s + (parseFloat(o.net_amount) || 0), 0);
+  const vendors = dbFallback.users.filter(u => u.role === 'vendor').length;
+  const revenue = dbFallback.orders.reduce((s, o) => s + (parseFloat(o.net_amount) || 0), 0);
   res.json({
     totalCustomers: customers,
-    totalVendors:   vendors,
-    totalProducts:  dbFallback.products.length,
-    totalOrders:    dbFallback.orders.length,
-    totalRevenue:   revenue,
-    totalNxl:       0,
+    totalVendors: vendors,
+    totalProducts: dbFallback.products.length,
+    totalOrders: dbFallback.orders.length,
+    totalRevenue: revenue,
+    totalNxl: 0,
   });
 });
 
@@ -1788,15 +1797,15 @@ app.get('/api/admin/orders', authenticateToken, requireAdmin, async (req, res) =
     const orderIds = dbResult.map(o => o.id);
     const allItems = orderIds.length > 0
       ? await executeQuery(
-          `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price,
+        `SELECT oi.order_id, oi.product_id, oi.quantity, oi.price,
                   COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS name,
                   COALESCE(NULLIF(oi.product_name, ''), p.name, '') AS product_name,
                   COALESCE(NULLIF(oi.image_url, ''),    p.image_url, '') AS image_url
            FROM order_items oi
            LEFT JOIN products p ON oi.product_id = p.id
            WHERE oi.order_id = ANY($1::uuid[])`,
-          [orderIds]
-        )
+        [orderIds]
+      )
       : [];
     // Group items by order_id
     const itemsByOrder = {};
@@ -2189,7 +2198,7 @@ app.get('/api/admin/coupons', authenticateToken, requireAdmin, async (req, res) 
 app.post('/api/admin/coupons', authenticateToken, requireAdmin, async (req, res) => {
   const { code, discount_percentage, max_discount, active_until, discount_type, discount_value, min_order_amount, status, category, usage_limit, customer_eligibility, start_date, per_user_limit, applicable_categories, applicable_products, applicable_vendors, applicable_users, priority, banner_image, description } = req.body;
   if (!code || !active_until) return res.status(400).json({ message: 'Code and active_until are required' });
-  
+
   const dp = discount_percentage || 0;
   const md = max_discount || 0;
   const dt = discount_type || 'percentage';
@@ -2223,7 +2232,7 @@ app.post('/api/admin/coupons', authenticateToken, requireAdmin, async (req, res)
 
 app.put('/api/admin/coupons/:id', authenticateToken, requireAdmin, async (req, res) => {
   const { code, discount_percentage, max_discount, active_until, discount_type, discount_value, min_order_amount, status, category, usage_limit, customer_eligibility, start_date, per_user_limit, applicable_categories, applicable_products, applicable_vendors, applicable_users, priority, banner_image, description } = req.body;
-  
+
   const dp = discount_percentage || 0;
   const md = max_discount || 0;
   const dt = discount_type || 'percentage';
@@ -2292,7 +2301,7 @@ app.post('/api/admin/users', authenticateToken, requireAdmin, async (req, res) =
     }
     return res.status(201).json(user);
   }
-  
+
   // Fallback
   const existing = dbFallback.users.find(u => u.email === email);
   if (existing) return res.status(400).json({ message: "Email already registered" });
@@ -2322,7 +2331,7 @@ app.post('/api/admin/vendors', authenticateToken, requireAdmin, async (req, res)
     }
     return res.status(201).json(user);
   }
-  
+
   // Fallback
   const existing = dbFallback.users.find(u => u.email === email);
   if (existing) return res.status(400).json({ message: "Email already registered" });
@@ -2342,7 +2351,7 @@ app.post('/api/admin/products', authenticateToken, requireAdmin, async (req, res
     [vendor_id, name, description || '', price, stock || 0, image_url || '', category || '']
   );
   if (dbResult) return res.status(201).json(dbResult[0]);
-  
+
   // Fallback
   const newProduct = {
     id: `prod-${Date.now()}`,
@@ -2374,7 +2383,7 @@ app.post('/api/admin/notifications', authenticateToken, requireAdmin, async (req
     [title, message, target || 'All Users']
   );
   if (dbResult) return res.status(201).json(dbResult[0]);
-  
+
   const newNotif = {
     id: `notif-${Date.now()}`,
     title,
@@ -2416,10 +2425,10 @@ app.post('/api/admin/promotions', authenticateToken, requireAdmin, async (req, r
   if (!title || !start_date || !end_date) return res.status(400).json({ message: 'Title, start_date, end_date required' });
   const dbResult = await executeQuery(
     'INSERT INTO promotions (title, description, discount, start_date, end_date, status) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [title, description||'', discount||0, start_date, end_date, status||'active']
+    [title, description || '', discount || 0, start_date, end_date, status || 'active']
   );
   if (dbResult) return res.status(201).json(dbResult[0]);
-  const np = { id: `promo-${Date.now()}`, title, description: description||'', discount: discount||0, start_date, end_date, status: status||'active', created_at: new Date() };
+  const np = { id: `promo-${Date.now()}`, title, description: description || '', discount: discount || 0, start_date, end_date, status: status || 'active', created_at: new Date() };
   dbFallback.promotions.push(np);
   res.status(201).json(np);
 });
@@ -2428,12 +2437,12 @@ app.put('/api/admin/promotions/:id', authenticateToken, requireAdmin, async (req
   const { title, description, discount, start_date, end_date, status } = req.body;
   const dbResult = await executeQuery(
     'UPDATE promotions SET title=$1,description=$2,discount=$3,start_date=$4,end_date=$5,status=$6 WHERE id=$7 RETURNING *',
-    [title, description||'', discount||0, start_date, end_date, status||'active', req.params.id]
+    [title, description || '', discount || 0, start_date, end_date, status || 'active', req.params.id]
   );
   if (dbResult && dbResult[0]) return res.json(dbResult[0]);
   const idx = dbFallback.promotions.findIndex(p => p.id === req.params.id);
   if (idx === -1) return res.status(404).json({ message: 'Promotion not found' });
-  dbFallback.promotions[idx] = { ...dbFallback.promotions[idx], title, description: description||'', discount: discount||0, start_date, end_date, status: status||'active' };
+  dbFallback.promotions[idx] = { ...dbFallback.promotions[idx], title, description: description || '', discount: discount || 0, start_date, end_date, status: status || 'active' };
   res.json(dbFallback.promotions[idx]);
 });
 
@@ -2459,10 +2468,10 @@ app.post('/api/admin/reward-rules', authenticateToken, requireAdmin, async (req,
   if (!spend_amount || !earn_credits) return res.status(400).json({ message: 'spend_amount and earn_credits required' });
   const dbResult = await executeQuery(
     'INSERT INTO reward_rules (spend_amount, earn_credits, description, is_active) VALUES ($1,$2,$3,$4) RETURNING *',
-    [spend_amount, earn_credits, description||`₹${spend_amount} spent = ${earn_credits} NXL Credits`, is_active !== false]
+    [spend_amount, earn_credits, description || `₹${spend_amount} spent = ${earn_credits} NXL Credits`, is_active !== false]
   );
   if (dbResult) return res.status(201).json(dbResult[0]);
-  const nr = { id: `rule-${Date.now()}`, spend_amount, earn_credits, description: description||`₹${spend_amount} spent = ${earn_credits} NXL Credits`, is_active: is_active !== false, created_at: new Date() };
+  const nr = { id: `rule-${Date.now()}`, spend_amount, earn_credits, description: description || `₹${spend_amount} spent = ${earn_credits} NXL Credits`, is_active: is_active !== false, created_at: new Date() };
   dbFallback.rewardRules.push(nr);
   res.status(201).json(nr);
 });
@@ -2517,7 +2526,7 @@ app.post('/api/admin/wallet-topup', authenticateToken, requireAdmin, async (req,
   dbFallback.wallets[user_id].transactions.unshift(tx);
   if (!dbFallback.topups) dbFallback.topups = [];
   const u = dbFallback.users.find(u => u.id === user_id);
-  dbFallback.topups.unshift({ id: tx.id, amount: parseFloat(amount), description: desc, created_at: tx.created_at, user_name: u?.name||'Unknown', user_email: u?.email||'' });
+  dbFallback.topups.unshift({ id: tx.id, amount: parseFloat(amount), description: desc, created_at: tx.created_at, user_name: u?.name || 'Unknown', user_email: u?.email || '' });
   res.json({ success: true, new_balance: dbFallback.wallets[user_id].balance });
 });
 
@@ -2531,7 +2540,7 @@ app.get('/api/admin/user-wallet/:user_id', authenticateToken, requireAdmin, asyn
   if (walletRes && walletRes[0]) return res.json({ wallet: walletRes[0], transactions: txRes || [] });
   const w = dbFallback.wallets[req.params.user_id] || { balance: 0, transactions: [] };
   const u = dbFallback.users.find(u => u.id === req.params.user_id);
-  res.json({ wallet: { balance: w.balance, name: u?.name||'Unknown', email: u?.email||'' }, transactions: w.transactions || [] });
+  res.json({ wallet: { balance: w.balance, name: u?.name || 'Unknown', email: u?.email || '' }, transactions: w.transactions || [] });
 });
 
 app.post('/api/admin/adjust-credits', authenticateToken, requireAdmin, async (req, res) => {
@@ -2554,8 +2563,8 @@ app.post('/api/admin/adjust-credits', authenticateToken, requireAdmin, async (re
 
 // ─── MERCHANT QR & PAYMENT ROUTES ────────────────────────────────────────────
 
-if (!dbFallback.merchantQRs)           dbFallback.merchantQRs = [];
-if (!dbFallback.merchantTransactions)  dbFallback.merchantTransactions = [];
+if (!dbFallback.merchantQRs) dbFallback.merchantQRs = [];
+if (!dbFallback.merchantTransactions) dbFallback.merchantTransactions = [];
 
 // Helper: generate a unique merchant_code  e.g. "MRC-A3F9B2"
 function generateMerchantCode() {
@@ -2592,6 +2601,106 @@ app.get('/api/admin/merchants', authenticateToken, requireAdmin, async (req, res
   res.json(approved);
 });
 
+// ── GET /api/customer/merchants — list approved merchants with active QR codes ──
+app.get('/api/customer/merchants', authenticateToken, async (req, res) => {
+  console.log("✅ /api/customer/merchants called");
+  if (pool) {
+    try {
+      const r = await pool.query(
+        `SELECT mr.id, mr.business_name, mr.owner_name, mr.email, mr.phone, mr.status, mr.created_at,
+                mq.merchant_code, mq.qr_data, mq.status AS qr_status
+         FROM merchant_requests mr
+         JOIN merchant_qr mq ON mq.merchant_id = mr.id::text
+         WHERE mr.status = 'Approved' AND mq.status = 'Active'
+         ORDER BY mr.business_name ASC`
+      );
+      console.log('[GET /api/customer/merchants] Rows returned:', r.rows.length, r.rows);
+      return res.json(r.rows);
+    } catch (e) {
+      console.error('[Customer Merchants]', e.message);
+      return res.status(500).json({ message: 'Failed to fetch merchants' });
+    }
+  }
+  // Fallback
+  const activeQRs = dbFallback.merchantQRs.filter(q => q.status === 'Active');
+  const approved = dbFallback.merchantRequests
+    .filter(m => m.status === 'Approved' && activeQRs.some(q => q.merchant_id === m.id))
+    .map(m => {
+      const qr = activeQRs.find(q => q.merchant_id === m.id);
+      return {
+        ...m,
+        merchant_code: qr?.merchant_code,
+        qr_data: qr?.qr_data,
+        qr_status: qr?.status
+      };
+    });
+  res.json(approved);
+});
+
+// ── GET /api/admin/merchant-payments — list all merchant payments ──────────────
+app.get('/api/admin/merchant-payments', authenticateToken, requireAdmin, async (req, res) => {
+  const { merchant_id, date, status } = req.query;
+
+  if (pool) {
+    try {
+      let queryStr = `
+        SELECT mt.*, mr.business_name, u.name as customer_name
+        FROM merchant_transactions mt
+        LEFT JOIN merchant_requests mr ON mt.merchant_id = CAST(mr.id AS TEXT) OR mt.merchant_id = mr.id::text
+        LEFT JOIN users u ON mt.customer_id = CAST(u.id AS TEXT) OR mt.customer_id = u.id::text
+        WHERE 1=1
+      `;
+      const queryParams = [];
+
+      if (merchant_id) {
+        queryParams.push(merchant_id);
+        queryStr += ` AND (mt.merchant_id = $${queryParams.length} OR mt.merchant_id = CAST($${queryParams.length} AS TEXT))`;
+      }
+
+      if (date) {
+        queryParams.push(date);
+        queryStr += ` AND DATE(mt.created_at) = DATE($${queryParams.length})`;
+      }
+
+      if (status) {
+        queryParams.push(status);
+        queryStr += ` AND mt.payment_status = $${queryParams.length}`;
+      }
+
+      queryStr += ` ORDER BY mt.created_at DESC`;
+
+      const r = await pool.query(queryStr, queryParams);
+      return res.json(r.rows);
+    } catch (e) {
+      console.error('[Admin Merchant Payments]', e.message);
+      return res.status(500).json({ message: 'Failed to fetch merchant payments' });
+    }
+  }
+
+  // Fallback
+  let txs = dbFallback.merchantTransactions.map(t => {
+    const mr = dbFallback.merchantRequests.find(m => m.id === t.merchant_id);
+    const cust = dbFallback.users?.find(u => u.id === t.customer_id) || { name: 'Customer' };
+    return {
+      ...t,
+      business_name: mr ? mr.business_name : 'Merchant',
+      customer_name: cust.name
+    };
+  });
+
+  if (merchant_id) {
+    txs = txs.filter(t => t.merchant_id === merchant_id);
+  }
+  if (date) {
+    txs = txs.filter(t => new Date(t.created_at).toISOString().split('T')[0] === date);
+  }
+  if (status) {
+    txs = txs.filter(t => t.payment_status?.toLowerCase() === status.toLowerCase());
+  }
+
+  res.json(txs);
+});
+
 // ── POST /api/admin/merchant/:id/generate-qr — generate or regenerate QR ─────
 app.post('/api/admin/merchant/:id/generate-qr', authenticateToken, requireAdmin, async (req, res) => {
   const merchant_id = req.params.id;
@@ -2609,13 +2718,8 @@ app.post('/api/admin/merchant/:id/generate-qr', authenticateToken, requireAdmin,
   if (merchant.status !== 'Approved') return res.status(400).json({ message: 'Merchant is not approved' });
 
   const merchant_code = generateMerchantCode();
-  // qr_data is the string the QR image encodes — contains merchant_id and merchant_code
-  const qr_data = JSON.stringify({
-    type:          'nexora_merchant_payment',
-    merchant_id:   merchant_id,
-    merchant_code: merchant_code,
-    business_name: merchant.business_name,
-  });
+  // qr_data is the string the QR image encodes — contains only merchant_id
+  const qr_data = merchant_id;
   const qr_status = 'Active';
 
   if (pool) {
@@ -2680,7 +2784,7 @@ app.post('/api/admin/merchant-qr/generate', authenticateToken, requireAdmin, asy
     if (merchant.status !== 'Approved') return res.status(400).json({ message: 'Merchant is not approved' });
 
     const merchant_code = generateMerchantCode();
-    const qr_data = JSON.stringify({ type: 'nexora_merchant_payment', merchant_id, merchant_code, business_name: merchant.business_name });
+    const qr_data = merchant_id;
     if (pool) {
       const r = await pool.query(
         `INSERT INTO merchant_qr (merchant_id, merchant_code, qr_data, status)
@@ -2728,19 +2832,19 @@ app.get('/api/merchant/dashboard', authenticateToken, async (req, res) => {
         [merchantId]
       );
       const txs = txRes.rows;
-      const total       = txs.reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
-      const todayTotal  = txs.filter(t => new Date(t.created_at) >= new Date(todayStart)).reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+      const total = txs.reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+      const todayTotal = txs.filter(t => new Date(t.created_at) >= new Date(todayStart)).reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
       const razorpayTot = txs.reduce((s, t) => s + parseFloat(t.razorpay_amount || 0), 0);
-      const nxlTot      = txs.reduce((s, t) => s + parseFloat(t.nxl_amount || 0), 0);
+      const nxlTot = txs.reduce((s, t) => s + parseFloat(t.nxl_amount || 0), 0);
       return res.json({ total_received: total, today_collection: todayTotal, razorpay_received: razorpayTot, nxl_received: nxlTot, transactions: txs });
     } catch (e) { console.error('[MerchantDashboard]', e.message); }
   }
   // Fallback
   const txs = dbFallback.merchantTransactions.filter(t => t.merchant_id === merchantId);
-  const total      = txs.reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+  const total = txs.reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
   const todayTotal = txs.filter(t => new Date(t.created_at) >= new Date(todayStart)).reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
-  const rzpTot     = txs.reduce((s, t) => s + parseFloat(t.razorpay_amount || 0), 0);
-  const nxlTot     = txs.reduce((s, t) => s + parseFloat(t.nxl_amount || 0), 0);
+  const rzpTot = txs.reduce((s, t) => s + parseFloat(t.razorpay_amount || 0), 0);
+  const nxlTot = txs.reduce((s, t) => s + parseFloat(t.nxl_amount || 0), 0);
   res.json({ total_received: total, today_collection: todayTotal, razorpay_received: rzpTot, nxl_received: nxlTot, transactions: txs });
 });
 
@@ -2773,7 +2877,7 @@ app.post('/api/merchant/payment/create-order', authenticateToken, async (req, re
     const order = await razorpay.orders.create({
       amount: Math.round(parseFloat(amount_inr) * 100),
       currency: 'INR',
-      receipt: `mp_${merchant_id.substring(0,8)}_${Date.now()}`,
+      receipt: `mp_${merchant_id.substring(0, 8)}_${Date.now()}`,
       payment_capture: 1,
     });
     res.json({ order_id: order.id, amount: order.amount, key_id: process.env.RAZORPAY_KEY_ID });
@@ -2808,14 +2912,14 @@ app.post('/api/merchant/payment/verify', authenticateToken, async (req, res) => 
         await pool.query(
           `INSERT INTO nxl_transactions (wallet_id, amount, transaction_type, description)
            VALUES ($1, $2, 'REDEEMED', $3)`,
-          [walletRes.rows[0].id, parseFloat(nxl_amount), `Paid to merchant ${merchant_id.substring(0,8)}`]
+          [walletRes.rows[0].id, parseFloat(nxl_amount), `Paid to merchant ${merchant_id.substring(0, 8)}`]
         );
       } catch (e) { console.error('[MerchantPayVerify] NXL deduct:', e.message); return res.status(500).json({ message: 'Failed to deduct NXL' }); }
     } else {
       const w = dbFallback.wallets[customerId];
       if (!w || w.balance < parseFloat(nxl_amount)) return res.status(400).json({ message: 'Insufficient NXL balance' });
       w.balance -= parseFloat(nxl_amount);
-      w.transactions.unshift({ id: `tx-${Date.now()}`, amount: parseFloat(nxl_amount), transaction_type: 'REDEEMED', description: `Paid to merchant ${merchant_id.substring(0,8)}`, created_at: new Date() });
+      w.transactions.unshift({ id: `tx-${Date.now()}`, amount: parseFloat(nxl_amount), transaction_type: 'REDEEMED', description: `Paid to merchant ${merchant_id.substring(0, 8)}`, created_at: new Date() });
     }
   }
 
@@ -2828,11 +2932,45 @@ app.post('/api/merchant/payment/verify', authenticateToken, async (req, res) => 
          VALUES ($1, $2, $3, $4, $5, $6, $7, 'Success') RETURNING *`,
         [txData.merchant_id, txData.customer_id, txData.total_amount, txData.razorpay_amount, txData.nxl_amount, txData.razorpay_payment_id, txData.razorpay_order_id]
       );
+
+      // Recalculate stats for the merchant
+      const now = new Date();
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const statsRes = await pool.query(
+        `SELECT 
+           COALESCE(SUM(total_amount), 0) as total,
+           COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_amount ELSE 0 END), 0) as today
+         FROM merchant_transactions 
+         WHERE merchant_id = $1`,
+        [txData.merchant_id, todayStart]
+      );
+      const newTotal = parseFloat(statsRes.rows[0].total);
+      const newToday = parseFloat(statsRes.rows[0].today);
+
+      await pool.query(
+        `UPDATE merchant_requests 
+         SET total_received = $1, today_collection = $2 
+         WHERE id = $3`,
+        [newTotal, newToday, txData.merchant_id]
+      );
+
       return res.json({ success: true, transaction: r.rows[0] });
     } catch (e) { console.error('[MerchantPayVerify] Insert tx:', e.message); }
   }
   const newTx = { id: `mtx-${Date.now()}`, ...txData, created_at: new Date() };
   dbFallback.merchantTransactions.push(newTx);
+
+  const mRec = dbFallback.merchantRequests.find(m => m.id === txData.merchant_id);
+  if (mRec) {
+    mRec.total_received = (parseFloat(mRec.total_received) || 0) + txData.total_amount;
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const mtxs = dbFallback.merchantTransactions.filter(t => t.merchant_id === txData.merchant_id);
+    mRec.today_collection = mtxs
+      .filter(t => new Date(t.created_at) >= todayStart)
+      .reduce((s, t) => s + parseFloat(t.total_amount || 0), 0);
+  }
+
   res.json({ success: true, transaction: newTx });
 });
 
@@ -3169,10 +3307,14 @@ async function runStartup() {
         pan VARCHAR(20) DEFAULT '',
         status VARCHAR(20) NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Approved', 'Rejected')),
         password_hash TEXT DEFAULT '',
+        total_received NUMERIC(10,2) DEFAULT 0.00,
+        today_collection NUMERIC(10,2) DEFAULT 0.00,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`,
       // Back-fill password_hash column for older installs
       `ALTER TABLE merchant_requests ADD COLUMN IF NOT EXISTS password_hash TEXT DEFAULT ''`,
+      `ALTER TABLE merchant_requests ADD COLUMN IF NOT EXISTS total_received NUMERIC(10,2) DEFAULT 0.00`,
+      `ALTER TABLE merchant_requests ADD COLUMN IF NOT EXISTS today_collection NUMERIC(10,2) DEFAULT 0.00`,
       // ── Merchant QR Codes table ───────────────────────────────────────────
       `CREATE TABLE IF NOT EXISTS merchant_qr (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -3201,8 +3343,10 @@ async function runStartup() {
         razorpay_payment_id TEXT DEFAULT '',
         razorpay_order_id TEXT DEFAULT '',
         payment_status VARCHAR(20) NOT NULL DEFAULT 'Success',
+        order_id TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )`,
+      `ALTER TABLE merchant_transactions ADD COLUMN IF NOT EXISTS order_id TEXT DEFAULT ''`,
     ];
 
     for (const q of startupQueries) {
@@ -3221,5 +3365,5 @@ async function runStartup() {
     console.log(`🚀 Nexora Store Server running on port ${PORT} [${mode}]`);
   });
 }
-
+console.log("✅ Customer Merchants API Loaded");
 runStartup();
